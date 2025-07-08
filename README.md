@@ -310,11 +310,13 @@ Currently, we release the following code and data:
 Please cite 🫐 ProX paper if you find our work helpful:
 
 ```bibtex
-@article{zhou2024programming,
-  title={Programming Every Example: Lifting Pre-training Data Quality like Experts at Scale},
-  author={Zhou, Fan and Wang, Zengzhi and Liu, Qian and Li, Junlong and Liu, Pengfei},
-  journal={arXiv preprint arXiv:2409.17115},
-  year={2024}
+@inproceedings{
+  zhou2025programming,
+  title={Programming Every Example: Lifting Pre-training Data Quality Like Experts at Scale},
+  author={Fan Zhou and Zengzhi Wang and Qian Liu and Junlong Li and Pengfei Liu},
+  booktitle={Forty-second International Conference on Machine Learning},
+  year={2025},
+  url={https://openreview.net/forum?id=ak0vlKTkpx}
 }
 ```
 
