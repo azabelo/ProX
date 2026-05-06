@@ -1,0 +1,86 @@
+# VeOmni + ``llada_mini``: tiny LLaDA-style **masked diffusion LM** (3 layers), ``build_foundation_model``.
+#
+# Random-init MDM (architecture in ``model_config`` below). Training loss is **diffusion masking CE**
+# inside ``LladaMiniForCausalLM`` (not shifted causal LM). Set ``diffusion_lm: true`` so VeOmni keeps labels aligned
+# with ``input_ids`` (no causal label shift) and parquet eval uses diffusion loss.
+#
+# Tokenizer from Hugging Face (Qwen2.5 vocab); adjust ``mask_token_id`` under ``model_config`` if needed.
+#
+# Run from repo root (single GPU):
+#   PYTHONPATH=finetuning/veomni python finetuning/finetune.py finetuning/example_finetune_veomni_llada_mini.yaml
+#
+# Eight GPUs (``num_gpus: 8`` re-execs via ``torch.distributed.run``): ensure ``global_batch_size`` is divisible by
+# ``micro_batch_size * num_gpus`` (e.g. ``global_batch_size: 8``, ``micro_batch_size: 1``).
+#
+# With ``diffusion_lm: true``, ``finetune.py`` disables VeOmni DDP ``MixedPrecision`` (PyTorch hook bugs around
+# embeddings). Token/time embeddings stay FP32 in the model; blocks run in the init dtype (typically BF16).
+
+model_arch: auto
+model_type: veomni_supported
+
+init_model_path: ""
+
+tokenizer_path: Qwen/Qwen2.5-0.5B
+
+resume_checkpoint_path: null
+
+inputs_dir_path: data/raw/DCLM-baseline-one-shard/global-shard_01_of_10/local-shard_0_of_10
+outputs_dir_path: openrouter_output_data/rewrite/1000docs
+
+dataset_type: dclm
+chunk_size: 1000
+is_code: false
+packing: false
+include_loss_from_input: false
+ensure_eos_on_target: true
+diffusion_lm: true
+
+num_gpus: 8
+num_validation_documents: 50
+
+max_seq_len: 512
+max_steps: 100
+num_train_epochs: 1
+micro_batch_size: 1
+global_batch_size: 8
+learning_rate: 2e-5
+warmup_ratio: 0.03
+weight_decay: 0.0
+max_grad_norm: 1.0
+lr_decay_style: cosine
+gradient_checkpointing: false
+
+eval_every_steps: 100
+eval_max_batches: 10
+save_every_steps: 10000
+
+wandb_project: prox-finetune
+wandb_run_name: veomni-llada-mini-3l-random-init
+
+checkpoint_output_dir: ./finetuning_outputs/veomni_llada_mini_3l_random_init
+
+custom_arch: {}
+
+model_config:
+  architectures: [LladaMiniForCausalLM]
+  model_type: llada_mini
+  vocab_size: 151936
+  hidden_size: 256
+  num_attention_heads: 8
+  intermediate_size: 512
+  num_hidden_layers: 3
+  max_position_embeddings: 2048
+  rope_theta: 10000.0
+  rms_norm_eps: 1.0e-6
+  attention_dropout: 0.0
+  residual_dropout: 0.0
+  num_diffusion_timesteps: 32
+  mask_token_id: 151935
+  tie_word_embeddings: false
+  scale_logits: false
+  torch_dtype: float32
+
+veomni_overrides:
+  model:
+    model_path: null
+    tokenizer_path: Qwen/Qwen2.5-0.5B

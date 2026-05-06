@@ -10,9 +10,10 @@ re-execs via ``torch.distributed.run`` (``num_gpus`` > 1) or sets single-process
 
 YAML schema (top-level keys):
   - model_arch: str (informational; also merged into ``veomni.model.foundation`` when provided)
-  - model_type: veomni_supported | huggingface | custom_local
+  - model_type: veomni_supported | huggingface
   - init_model_path: HuggingFace hub id or local path for base weights (maps to VeOmni ``model.model_path``)
-  - resume_checkpoint_path: optional VeOmni DCP dir (e.g. ``.../checkpoints/global_step_1000``) for full resume
+  - resume_checkpoint_path: optional VeOmni DCP dir (must contain ``.metadata``). Relative paths: try ``cwd`` first,
+    then the YAML file's directory. Invalid/missing checkpoints fail fast before distributed launch.
   - inputs_dir_path: directory of source shards (``.parquet`` or ``*.jsonl.zst``)
   - outputs_dir_path: OpenRouter output directory (copied YAML + ``*_openrouter.parquet``)
   - dataset_type: fineweb | dclm | redpajama | redpajama-v2 | passthrough (row text adapter, same as OpenRouter runner)
@@ -20,21 +21,25 @@ YAML schema (top-level keys):
   - is_code: bool — read ``programs_delimited`` vs ``text`` from output rows
   - packing: bool — VeOmni: enables ``dyn_bsz`` token packing; HF: packs examples in the collator up to ``max_seq_len``
   - include_loss_from_input: bool default false — false: CE only on assistant/output tokens (VeOmni ``text_target``)
+  - diffusion_lm: bool default false — for masked diffusion LMs (e.g. ``llada_mini``), patches the VeOmni collator after trainer init so labels stay aligned with ``input_ids`` (no causal shift)
   - num_gpus: int — used only for auto ``torchrun`` re-exec
   - num_validation_documents: int — documents held out entirely for validation (by ``source_parquet`` + ``source_row_index``)
   - max_seq_len, max_steps, global_batch_size, micro_batch_size, learning_rate, weight_decay, warmup_ratio,
     lr_decay_style, max_grad_norm, save_every_steps, eval_every_steps, checkpoint_output_dir, seed, wandb_project,
-    wandb_run_name, gradient_checkpointing, tokenizer_path (optional override), custom_model_factory (for custom_local:
-    ``"module.path:callable"`` returning a ``torch.nn.Module``)
+    wandb_run_name, gradient_checkpointing, tokenizer_path (optional override)
+  - model_config: optional mapping — HF-style model hyperparameters for random-init/custom architectures; merged last,
+    overrides ``veomni_overrides.model.config_path``, written to ``checkpoint_output_dir/.finetune_inline_config/config.json``
 
-Optional nested ``veomni:`` dict is deep-merged into the constructed VeOmni YAML dict before dataclass load.
+Optional nested ``veomni_overrides:`` (legacy ``veomni:``) dict is deep-merged into the constructed VeOmni YAML dict.
 
-``custom_local`` is experimental: you must set ``custom_model_factory``; training uses a minimal AdamW loop with
-the same paired parquet dataloader as the HF path (single-process unless you extend it).
+For random-init / custom stacks (``test_everything``, ``llada_mini``, ``qwen2_swa``, ``qwen2_mamba``, …), put the HuggingFace-style
+model JSON fields under top-level ``model_config:`` (same keys as ``config.json``). At startup, ``finetune.py`` writes
+``<checkpoint_output_dir>/.finetune_inline_config/config.json`` so VeOmni can load it—no checked-in ``config.json``
+required.
 """
 from __future__ import annotations
 
-import importlib
+import json
 import math
 import os
 import random
@@ -42,9 +47,10 @@ import subprocess
 import sys
 import types
 import warnings
-from dataclasses import asdict, dataclass, field
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import yaml
 
@@ -234,17 +240,21 @@ class FinetuneConfig:
     wandb_project: str = "prox-finetune"
     wandb_run_name: str | None = None
     gradient_checkpointing: bool = True
-    custom_model_factory: str | None = None
     veomni_overrides: dict[str, Any] = field(default_factory=dict)
     # If True, append tokenizer eos to each target string when encode(target) does not already end with eos_token_id
     # so the last supervised token in chat/text_target loss can be EOS (helps learned stopping in generate()).
     ensure_eos_on_target: bool = True
+    diffusion_lm: bool = False
+    # HuggingFace-style model config dict (optional). When set, overrides ``veomni_overrides.model.config_path`` and
+    # is written to ``checkpoint_output_dir/.finetune_inline_config/config.json`` at run time.
+    model_config: dict[str, Any] | None = None
 
     @staticmethod
     def from_dict(raw: dict[str, Any], config_path: str) -> "FinetuneConfig":
         def g(key: str, default: Any = None) -> Any:
             return raw[key] if key in raw else default
 
+        _mc_raw = g("model_config")
         return FinetuneConfig(
             config_path=config_path,
             model_arch=str(g("model_arch", "auto")),
@@ -279,10 +289,82 @@ class FinetuneConfig:
             wandb_project=str(g("wandb_project", "prox-finetune")),
             wandb_run_name=g("wandb_run_name", None),
             gradient_checkpointing=_bool(g("gradient_checkpointing", True)),
-            custom_model_factory=g("custom_model_factory", None),
-            veomni_overrides=dict(g("veomni", {}) or {}),
+            veomni_overrides=dict(g("veomni_overrides", g("veomni", {})) or {}),
             ensure_eos_on_target=_bool(g("ensure_eos_on_target", True)),
+            diffusion_lm=_bool(g("diffusion_lm", False)),
+            model_config=_mc_raw if _mc_raw else None,
         )
+
+
+def _finalize_resume_checkpoint_path(cfg: FinetuneConfig) -> None:
+    """Resolve ``resume_checkpoint_path`` and require a valid DCP tree before VeOmni touches ``load_path``.
+
+    VeOmni always consumes ``train.checkpoint.load_path`` when non-null, so a stale YAML path must not
+    reach the trainer (otherwise every rank fails opening ``.metadata``).
+    """
+    raw = cfg.resume_checkpoint_path
+    if raw is None:
+        return
+    s = str(raw).strip()
+    if not s or s.lower() in ("null", "none"):
+        cfg.resume_checkpoint_path = None
+        return
+    cfg_yaml = Path(cfg.config_path).resolve()
+    rel = Path(s).expanduser()
+    if rel.is_absolute():
+        p = rel.resolve()
+    else:
+        cwd_p = (Path.cwd() / rel).resolve()
+        yaml_p = (cfg_yaml.parent / rel).resolve()
+        if (cwd_p / ".metadata").is_file():
+            p = cwd_p
+        elif (yaml_p / ".metadata").is_file():
+            p = yaml_p
+        else:
+            # Prefer cwd in errors (typical: paths mirror ``checkpoint_output_dir`` from repo root).
+            p = cwd_p
+    meta = p / ".metadata"
+    if not p.is_dir():
+        alt = ""
+        if not rel.is_absolute():
+            other = (yaml_p if p == cwd_p else cwd_p).resolve()
+            if other != p:
+                alt = f"\n  Also checked: {other}"
+        raise SystemExit(
+            f"[finetune] resume_checkpoint_path is not a directory:\n  {p}\n"
+            f"  (YAML had {raw!r}; relative paths try cwd={Path.cwd().resolve()!s} then {cfg_yaml.parent!s}){alt}"
+        )
+    if not meta.is_file():
+        ms = cfg.max_steps
+        step_hint = (
+            f"With save_every_steps={cfg.save_every_steps} and max_steps={ms!r}, "
+            f"intermediate saves only occur at multiples of save_every_steps; "
+            f"train-end may write global_step_<last_step> instead."
+            if ms is not None
+            else f"With save_every_steps={cfg.save_every_steps}, check which global_step_* dirs exist."
+        )
+        raise SystemExit(
+            f"[finetune] resume_checkpoint_path is not a VeOmni DCP checkpoint (missing .metadata):\n  {meta}\n"
+            f"  {step_hint}\n"
+            f"  List checkpoints: ls {p.parent.resolve()!s}/global_step_* 2>/dev/null || true"
+        )
+    cfg.resume_checkpoint_path = str(p)
+
+
+def _materialize_inline_model_config(cfg: FinetuneConfig) -> str | None:
+    """Write ``cfg.model_config`` to disk for VeOmni ``AutoConfig.from_pretrained(dir)``.
+
+    Returns the directory path containing ``config.json``, or ``None`` if no inline config.
+    """
+    mc = getattr(cfg, "model_config", None)
+    if not mc:
+        return None
+    out_dir = Path(cfg.checkpoint_output_dir).expanduser().resolve() / ".finetune_inline_config"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    dest = out_dir / "config.json"
+    dest.write_text(json.dumps(mc, indent=2, sort_keys=False) + "\n", encoding="utf-8")
+    print(f"[finetune] inline model_config written to {dest}", flush=True)
+    return str(out_dir)
 
 
 def _ensure_eos_on_targets(cfg: FinetuneConfig, rows: list[dict[str, str]]) -> None:
@@ -526,10 +608,6 @@ def _veomni_dict(cfg: FinetuneConfig, train_parquet: str, eval_parquet: str | No
     foundation: dict[str, str] = {}
     if cfg.model_arch and cfg.model_arch != "auto":
         foundation["architecture"] = cfg.model_arch
-    # When training a custom_local-style model through VeOmni, we still want the
-    # factory to be able to read YAML `custom_arch` from the original finetune config.
-    if cfg.custom_model_factory:
-        foundation["finetune_config_path"] = str(cfg.config_path)
 
     dyn_bsz = bool(cfg.packing)
     data_type = "text_target_all" if cfg.include_loss_from_input else "text_target"
@@ -598,20 +676,18 @@ def _veomni_dict(cfg: FinetuneConfig, train_parquet: str, eval_parquet: str | No
             },
         },
     }
-    if cfg.custom_model_factory:
-        base["model"]["custom_model_factory"] = cfg.custom_model_factory
-    return _deep_update(base, dict(cfg.veomni_overrides))
-
-
-def _import_callable(spec: str) -> Callable[..., Any]:
-    if ":" not in spec:
-        raise SystemExit("custom_model_factory must look like 'package.module:fn'")
-    mod_name, _, attr = spec.partition(":")
-    mod = importlib.import_module(mod_name)
-    fn = getattr(mod, attr, None)
-    if not callable(fn):
-        raise SystemExit(f"{spec!r} is not callable")
-    return fn
+    merged = _deep_update(base, dict(cfg.veomni_overrides))
+    inline_cfg_dir = _materialize_inline_model_config(cfg)
+    if inline_cfg_dir:
+        merged.setdefault("model", {})["config_path"] = inline_cfg_dir
+    # ``DistributedDataParallel`` + ``MixedPrecision`` around ``nn.Embedding`` breaks autograd hooks on
+    # PyTorch 2.x (SIGSEGV / None grad_fn / mixed_precision_hooks NoneType). Llada uses FP32 embedding
+    # tables and BF16 blocks without DDP's MP wrapper (see ``modeling_llada_mini``).
+    if cfg.diffusion_lm:
+        merged.setdefault("train", {}).setdefault("accelerator", {}).setdefault("fsdp_config", {}).setdefault(
+            "mixed_precision", {}
+        )["enable"] = False
+    return merged
 
 
 def _write_pair_parquet(rows: list[dict[str, str]], path: Path) -> None:
@@ -631,6 +707,78 @@ def _unwrap_for_generate(model: Any) -> Any:
     while hasattr(m, "_fsdp_wrapped_module"):
         m = m._fsdp_wrapped_module
     return m
+
+
+@contextmanager
+def _inference_inner(model: Any):
+    """Yield the unwrapped inner module for **rank-0-only** eval, with DDP comm + MP hooks neutralized.
+
+    Two distinct multi-GPU pitfalls are addressed:
+
+    1. **DDP buffer-sync collective.** ``DistributedDataParallel`` defaults to ``broadcast_buffers=True`` and
+       runs ``_sync_buffers()`` (a NCCL broadcast) inside ``_pre_forward`` on every call. Models with
+       persistent buffers (e.g. Qwen ``rotary_emb.inv_freq``) deadlock if only rank 0 calls forward while
+       the other ranks wait at ``dist.barrier()``. Calling the **inner unwrapped module** bypasses
+       ``_pre_forward`` entirely.
+
+    2. **DDP mixed-precision forward pre-hooks.** ``_root_copy_hook`` (on the inner root) and
+       ``_module_wait_for_copy_hook`` (on every submodule) get installed when MP is enabled. Under
+       ``torch.no_grad()``, ``tmp = p.expand_as(p); tmp.grad_fn.next_functions[0][0]`` raises
+       ``'NoneType' object has no attribute 'next_functions'``. We detach both for the scope; they are
+       not needed for rank-0 forward (no comm, no MP copies needed for inference).
+
+    Also clears ``requires_grad`` defensively so any other autograd-aware hook short-circuits.
+    """
+    try:
+        from torch.nn.parallel.distributed import DistributedDataParallel as _DDP
+    except Exception:
+        _DDP = None  # type: ignore[assignment]
+
+    inner = _unwrap_for_generate(model)
+    ddp = model if (_DDP is not None and isinstance(model, _DDP)) else None
+
+    saved_hooks: list[tuple[Any, int, Any, bool]] = []
+    if ddp is not None and getattr(ddp, "mixed_precision", None) is not None:
+        target_funcs = {
+            getattr(ddp._root_copy_hook, "__func__", None),
+            getattr(ddp._module_wait_for_copy_hook, "__func__", None),
+        }
+        target_funcs.discard(None)
+        for sub in inner.modules():
+            pre = getattr(sub, "_forward_pre_hooks", None)
+            if not pre:
+                continue
+            wk = getattr(sub, "_forward_pre_hooks_with_kwargs", {}) or {}
+            for hid in list(pre.keys()):
+                hcall = pre[hid]
+                f = getattr(hcall, "__func__", None)
+                s = getattr(hcall, "__self__", None)
+                if f in target_funcs and s is ddp:
+                    saved_hooks.append((sub, hid, hcall, bool(wk.get(hid, False))))
+                    del pre[hid]
+                    wk.pop(hid, None)
+
+    params = list(inner.parameters())
+    prev_rg = [p.requires_grad for p in params]
+    try:
+        for p in params:
+            p.requires_grad_(False)
+        yield inner
+    finally:
+        for p, r in zip(params, prev_rg):
+            p.requires_grad_(r)
+        for sub, hid, hcall, with_kwargs in saved_hooks:
+            sub._forward_pre_hooks[hid] = hcall
+            if with_kwargs:
+                sub._forward_pre_hooks_with_kwargs[hid] = True
+
+
+# Back-compat alias: existing callers that only need the autograd/hook neutralization (no inner unwrap).
+@contextmanager
+def _ddp_mp_safe_no_grad(model: Any):
+    """Backward-compatible shim around :func:`_inference_inner` (discards the yielded inner module)."""
+    with _inference_inner(model):
+        yield
 
 
 def _masked_lm_token_sums(
@@ -683,6 +831,10 @@ def _attach_veomni_lm_entropy_wandb(trainer: Any) -> None:
     acc = {"sum": 0.0, "n": 0}
 
     def _hook(_mod: Any, _inp: Any, out: Any) -> None:
+        # Parquet eval runs ``model.eval()`` on rank 0 only; skip hook work so we do not touch
+        # ``lm_head`` outputs outside normal training forwards (avoids autograd/DDP edge cases).
+        if not _mod.training:
+            return
         if out is None:
             return
         with torch.no_grad():
@@ -724,8 +876,17 @@ def _eval_sanity_check(
     device: Any,
     max_new_tokens: int,
     global_step: int,
+    diffusion_lm: bool = False,
 ) -> None:
-    """Print first row input/target from val parquet and a greedy ``generate`` prediction."""
+    """Print first row input/target from val parquet and a short prediction.
+
+    Causal LMs use greedy ``generate``. For ``diffusion_lm`` (e.g. ``llada_mini``), runs one parallel
+    decode at inference timestep 0: prompt + trailing ``mask_token_id`` positions, argmax on the suffix
+    (sanity logging only; not full iterative diffusion sampling).
+
+    Uses ``_ddp_mp_safe_no_grad`` (which detaches DDP mixed-precision forward pre-hooks for the scope) so
+    HuggingFace ``generate()`` (decorated with ``@torch.no_grad``) doesn't crash under DDP+MP.
+    """
     import torch
 
     path = Path(val_parquet_path)
@@ -750,37 +911,74 @@ def _eval_sanity_check(
         {"role": "user", "content": src},
     ]
     tok = tokenizer
-    gen_m = _unwrap_for_generate(model)
-    pad_id = tok.pad_token_id if getattr(tok, "pad_token_id", None) is not None else tok.eos_token_id
 
     pred = ""
-    try:
-        with torch.no_grad():
-            if getattr(tok, "chat_template", None):
-                ids = tok.apply_chat_template(
-                    messages,
-                    tokenize=True,
-                    add_generation_prompt=True,
-                    return_tensors="pt",
-                )
-            else:
-                prompt_txt = f"[SYSTEM]\n{system_msg}\n[USER]\n{src}\n[ASSISTANT]\n"
-                ids = tok(prompt_txt, return_tensors="pt")["input_ids"]
-            ids = ids.to(device)
-            attn = torch.ones_like(ids, dtype=torch.long, device=device)
-            cap = max(32, min(int(max_new_tokens), 4096))
-            gen_out = gen_m.generate(
-                ids,
-                attention_mask=attn,
-                max_new_tokens=cap,
-                do_sample=False,
-                pad_token_id=pad_id,
-                eos_token_id=tok.eos_token_id,
-            )
-            new_tokens = gen_out[0][ids.shape[1] :]
-            pred = tok.decode(new_tokens.cpu(), skip_special_tokens=True)
-    except Exception as e:
-        pred = f"<generate failed: {e}>"
+    if diffusion_lm:
+        try:
+            with _inference_inner(model) as inner:
+                with torch.no_grad():
+                    mask_id = getattr(getattr(inner, "config", None), "mask_token_id", None)
+                    if mask_id is None:
+                        pred = "<skipped: diffusion_lm model has no config.mask_token_id>"
+                    else:
+                        if getattr(tok, "chat_template", None):
+                            ids = tok.apply_chat_template(
+                                messages,
+                                tokenize=True,
+                                add_generation_prompt=True,
+                                return_tensors="pt",
+                            )
+                        else:
+                            prompt_txt = f"[SYSTEM]\n{system_msg}\n[USER]\n{src}\n[ASSISTANT]\n"
+                            ids = tok(prompt_txt, return_tensors="pt")["input_ids"]
+                        ids = ids.to(device)
+                        prompt_len = int(ids.shape[1])
+                        max_pos = int(getattr(inner.config, "max_position_embeddings", 2048))
+                        cap = max(32, min(int(max_new_tokens), 4096))
+                        gen_len = min(cap, max_pos - prompt_len)
+                        if gen_len <= 0:
+                            pred = "<skipped: prompt fills context — no room for mask suffix>"
+                        else:
+                            suffix = torch.full((1, gen_len), int(mask_id), dtype=torch.long, device=device)
+                            full = torch.cat([ids, suffix], dim=1)
+                            attn = torch.ones_like(full, dtype=torch.long, device=device)
+                            out = inner(input_ids=full, attention_mask=attn, labels=None)
+                            logits = out.logits
+                            pred_ids = logits[0, prompt_len:, :].argmax(dim=-1)
+                            pred = tok.decode(pred_ids.cpu(), skip_special_tokens=True)
+        except Exception as e:
+            pred = f"<diffusion sanity decode failed: {e}>"
+    else:
+        pad_id = tok.pad_token_id if getattr(tok, "pad_token_id", None) is not None else tok.eos_token_id
+        try:
+            with _inference_inner(model) as inner:
+                with torch.no_grad():
+                    if getattr(tok, "chat_template", None):
+                        ids = tok.apply_chat_template(
+                            messages,
+                            tokenize=True,
+                            add_generation_prompt=True,
+                            return_tensors="pt",
+                        )
+                    else:
+                        prompt_txt = f"[SYSTEM]\n{system_msg}\n[USER]\n{src}\n[ASSISTANT]\n"
+                        ids = tok(prompt_txt, return_tensors="pt")["input_ids"]
+                    ids = ids.to(device)
+                    attn = torch.ones_like(ids, dtype=torch.long, device=device)
+                    cap = max(32, min(int(max_new_tokens), 4096))
+                    gen_out = inner.generate(
+                        ids,
+                        attention_mask=attn,
+                        max_new_tokens=cap,
+                        do_sample=False,
+                        pad_token_id=pad_id,
+                        eos_token_id=tok.eos_token_id,
+                        use_cache=True,
+                    )
+                    new_tokens = gen_out[0][ids.shape[1] :]
+                    pred = tok.decode(new_tokens.cpu(), skip_special_tokens=True)
+        except Exception as e:
+            pred = f"<generate failed: {e}>"
 
     print(
         f"[eval] sanity check (step={global_step}; first val row)\n"
@@ -791,30 +989,67 @@ def _eval_sanity_check(
     )
 
 
-def _build_parquet_eval_callback(trainer: Any, val_parquet: str | None, max_batches: int) -> Any:
-    """Mean CE on a held-out pair parquet (rank 0 only)."""
+def _build_parquet_eval_callback(
+    trainer: Any, val_parquet: str | None, max_batches: int, diffusion_lm: bool = False
+) -> Any:
+    """Mean CE on a held-out pair parquet.
+
+    Evaluation runs on **rank 0 only** (parquet I/O + short greedy sanity decode). Non-zero ranks wait at
+    ``dist.barrier()`` before and after so they never advance to the next training step / ``on_train_end``
+    while rank 0 is still in eval (avoids DDP deadlock).
+
+    For ``diffusion_lm=True``, uses the model's scalar diffusion loss (masked CE); causal shifted CE is wrong for MDM.
+    """
 
     from veomni.trainer.callbacks.evaluate_callback import EvaluateCallback
 
     class ParquetEvalCallback(EvaluateCallback):
-        def __init__(self, t: Any, vp: str | None, mb: int) -> None:
+        def __init__(self, t: Any, vp: str | None, mb: int, diffusion: bool) -> None:
             super().__init__(t)
             self.val_parquet = vp
             self.max_batches = mb
+            self.diffusion_lm = diffusion
             self._built = False
             self._loader = None
+
+        def on_train_end(self, state: Any) -> None:
+            """If training stopped between eval intervals, run eval once (HF-style final eval)."""
+            args = self.trainer.args
+            es = getattr(args.train, "eval_steps", None)
+            if not es:
+                return
+            if not self.val_parquet or not Path(self.val_parquet).is_file():
+                return
+            if state.global_step <= 0:
+                return
+            if state.global_step % es == 0:
+                return
+            self._evaluate(state)
 
         def _evaluate(self, state: Any) -> None:
             if not self.val_parquet or not Path(self.val_parquet).is_file():
                 return
             import torch
+            import torch.distributed as dist
             from torch.utils.data import DataLoader
+            from tqdm.auto import tqdm
+
             from veomni.data.data_transform import build_data_transform
             from veomni.data.dataset import build_mapping_dataset
             from veomni.utils import helper
 
             args = self.trainer.args
-            if args.train.global_rank != 0:
+            rank = dist.get_rank() if dist.is_initialized() else 0
+
+            # Keep all ranks in lockstep: rank 0 runs I/O-heavy eval; others must wait here or they will
+            # start the next optimizer step / hit train-end barriers first (classic DDP eval deadlock).
+            if dist.is_initialized():
+                dist.barrier()
+
+            if rank != 0:
+                if dist.is_initialized():
+                    dist.barrier()
+                self.trainer.model.train()
                 return
 
             if not self._built:
@@ -825,7 +1060,18 @@ def _build_parquet_eval_callback(trainer: Any, val_parquet: str | None, max_batc
                     max_seq_len=args.data.max_seq_len,
                     text_keys=args.data.text_keys,
                 )
-                ds = build_mapping_dataset(train_path=self.val_parquet, transform=transform, namespace="train")
+                # Only rank 0 loads eval parquet; must not use main_process_first() (its barrier waits on all ranks).
+                ds = build_mapping_dataset(
+                    train_path=self.val_parquet,
+                    transform=transform,
+                    namespace="train",
+                    distributed_sync=False,
+                )
+                try:
+                    _nel = len(ds)
+                except TypeError:
+                    _nel = "?"
+                helper.logger.info_rank0(f"[eval] val mapping dataset size={_nel} path={self.val_parquet}")
 
                 def collate(batch: list) -> Any:
                     flat = []
@@ -833,7 +1079,9 @@ def _build_parquet_eval_callback(trainer: Any, val_parquet: str | None, max_batc
                         flat.append(item[0] if isinstance(item, list) else item)
                     return self.trainer.collate_fn(flat)
 
-                self._loader = DataLoader(ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=collate)
+                self._loader = DataLoader(
+                    ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=collate
+                )
                 self._built = True
 
             from veomni.utils.constants import IGNORE_INDEX
@@ -843,27 +1091,83 @@ def _build_parquet_eval_callback(trainer: Any, val_parquet: str | None, max_batc
             total_ent_sum = 0.0
             n_tokens = 0
             n_batches = 0
-            with torch.no_grad():
-                for i, micro in enumerate(self._loader):
-                    if i >= self.max_batches:
-                        break
-                    mb = micro[0] if isinstance(micro, list) else micro
-                    mb = {
-                        k: v.to(self.trainer.device, non_blocking=True) if torch.is_tensor(v) else v
-                        for k, v in mb.items()
-                    }
-                    out = self.trainer.model(**mb, use_cache=False)
-                    if out.logits is None or "labels" not in mb:
-                        continue
-                    ce_sum, ent_sum, nt = _masked_lm_token_sums(out.logits, mb["labels"], IGNORE_INDEX)
-                    if nt == 0:
-                        continue
-                    total_ce_sum += ce_sum
-                    total_ent_sum += ent_sum
-                    n_tokens += nt
-                    n_batches += 1
+            diffusion_loss_sum = 0.0
+            n_diff_batches = 0
+            hf_batch_losses: list[float] = []
+            _cap = self.max_batches
+            try:
+                _loader_len = min(_cap, len(self._loader))  # type: ignore[arg-type]
+            except Exception:
+                _loader_len = None
+            import sys as _sys
+            import time as _time
 
-            if n_tokens > 0:
+            t0 = _time.time()
+            # IMPORTANT: use inner unwrapped module so we bypass DDP `_pre_forward._sync_buffers` (a NCCL
+            # collective) which would deadlock since only rank 0 enters this block.
+            with _inference_inner(self.trainer.model) as inner:
+                with torch.no_grad():
+                    # ``leave=True``: ``leave=False`` clears the bar when eval finishes — easy to miss in logs.
+                    # ``position=1``: nest under VeOmni's epoch ``trange`` (rank-0 training bar) so both stay readable.
+                    bar = tqdm(
+                        self._loader,
+                        desc=f"[eval] CE batches (step {state.global_step})",
+                        total=_loader_len,
+                        leave=True,
+                        position=1,
+                        file=_sys.stdout,
+                        mininterval=0.2,
+                        dynamic_ncols=True,
+                    )
+                    for i, micro in enumerate(bar):
+                        if i >= self.max_batches:
+                            break
+                        mb = micro[0] if isinstance(micro, list) else micro
+                        mb = {
+                            k: v.to(self.trainer.device, non_blocking=True) if torch.is_tensor(v) else v
+                            for k, v in mb.items()
+                        }
+                        out = inner(**mb, use_cache=False)
+                        if "labels" not in mb:
+                            continue
+                        if self.diffusion_lm:
+                            if out.loss is None:
+                                continue
+                            diffusion_loss_sum += float(out.loss.item())
+                            n_diff_batches += 1
+                            n_batches += 1
+                            continue
+                        if getattr(out, "loss", None) is not None:
+                            hf_batch_losses.append(float(out.loss.item()))
+                        if out.logits is None:
+                            continue
+                        ce_sum, ent_sum, nt = _masked_lm_token_sums(out.logits, mb["labels"], IGNORE_INDEX)
+                        if nt == 0:
+                            continue
+                        total_ce_sum += ce_sum
+                        total_ent_sum += ent_sum
+                        n_tokens += nt
+                        n_batches += 1
+                    bar.close()
+            helper.logger.info_rank0(
+                f"[eval] step={state.global_step} CE eval done in {(_time.time() - t0):.2f}s "
+                f"({n_batches} batches)"
+            )
+
+            if self.diffusion_lm and n_diff_batches > 0:
+                mean_dl = diffusion_loss_sum / n_diff_batches
+                helper.logger.info_rank0(
+                    f"[eval] step={state.global_step} diffusion_ce_mean_batch={mean_dl:.4f} "
+                    f"(batches={n_diff_batches})"
+                )
+                try:
+                    import wandb
+
+                    if args.train.wandb.enable:
+                        wandb.log({"eval/loss": mean_dl}, step=state.global_step)
+                except Exception:
+                    pass
+            elif n_tokens > 0:
                 mean_ce = total_ce_sum / n_tokens
                 mean_ent = total_ent_sum / n_tokens
                 ppl = math.exp(mean_ce)
@@ -885,6 +1189,30 @@ def _build_parquet_eval_callback(trainer: Any, val_parquet: str | None, max_batc
                         )
                 except Exception:
                     pass
+            elif hf_batch_losses:
+                mean_hf = sum(hf_batch_losses) / len(hf_batch_losses)
+                helper.logger.info_rank0(
+                    f"[eval] step={state.global_step} mean_loss={mean_hf:.4f} from model loss "
+                    f"(batches={len(hf_batch_losses)}; token-level CE skipped — often logits/token mask mismatch)"
+                )
+                try:
+                    import wandb
+
+                    if args.train.wandb.enable:
+                        wandb.log(
+                            {
+                                "eval/loss": mean_hf,
+                                "eval/perplexity": math.exp(mean_hf),
+                            },
+                            step=state.global_step,
+                        )
+                except Exception:
+                    pass
+            else:
+                helper.logger.warning_rank0(
+                    "[eval] No loss or supervised tokens in validation batches "
+                    "(check val parquet, labels, and model outputs). Sanity decode still runs below."
+                )
 
             _eval_sanity_check(
                 val_parquet_path=self.val_parquet,
@@ -893,10 +1221,29 @@ def _build_parquet_eval_callback(trainer: Any, val_parquet: str | None, max_batc
                 device=self.trainer.device,
                 max_new_tokens=min(512, int(args.data.max_seq_len)),
                 global_step=int(state.global_step),
+                diffusion_lm=self.diffusion_lm,
             )
+            if dist.is_initialized():
+                dist.barrier()
+
             self.trainer.model.train()
 
-    return ParquetEvalCallback(trainer, val_parquet, max_batches)
+    return ParquetEvalCallback(trainer, val_parquet, max_batches, diffusion_lm)
+
+
+def _maybe_patch_diffusion_lm_collator(trainer: Any, diffusion_lm: bool) -> None:
+    """Masked diffusion LMs need labels aligned with ``input_ids`` (no causal label shift in the collator)."""
+    if not diffusion_lm:
+        return
+    from veomni.data.data_collator import MainCollator
+
+    base_tr = trainer.base
+    args = base_tr.args
+    base_tr.collate_fn = MainCollator(
+        pad_to_length=args.train.pad_to_length,
+        seq_classification=True,
+    )
+    base_tr._build_dataloader()
 
 
 def run_veomni(cfg: FinetuneConfig, train_parquet: str, eval_parquet: str | None) -> None:
@@ -916,9 +1263,24 @@ def run_veomni(cfg: FinetuneConfig, train_parquet: str, eval_parquet: str | None
     args.compute_train_steps(dataset_length=args.data.train_sample)
 
     trainer = TextTrainer(args)
-    trainer.base.evaluate_callback = _build_parquet_eval_callback(trainer.base, eval_parquet, cfg.eval_max_batches)
+    _maybe_patch_diffusion_lm_collator(trainer, cfg.diffusion_lm)
+    trainer.base.evaluate_callback = _build_parquet_eval_callback(
+        trainer.base, eval_parquet, cfg.eval_max_batches, cfg.diffusion_lm
+    )
     _attach_veomni_lm_entropy_wandb(trainer)
     trainer.train()
+
+    # After train(), distributed is torn down; LOCAL_RANK still identifies the primary process under torchrun.
+    if int(os.environ.get("LOCAL_RANK", "0")) == 0:
+        base = trainer.base
+        gs = int(base.state.global_step)
+        if gs > 0:
+            ckpt_dir = Path(base.args.train.checkpoint.save_path) / f"global_step_{gs}"
+            print(f"[finetune] Final checkpoint (DCP): {ckpt_dir.resolve()}", flush=True)
+            if getattr(base.args.train.checkpoint, "save_hf_weights", False):
+                print(f"[finetune] HuggingFace export: {(ckpt_dir / 'hf_ckpt').resolve()}", flush=True)
+        else:
+            print("[finetune] No checkpoint directory (global_step is 0).", flush=True)
 
 
 def _hf_pair_tokenize_batch(cfg: FinetuneConfig, tok: Any, examples: dict[str, list]) -> dict[str, list]:
@@ -1115,129 +1477,12 @@ def run_huggingface(
                     device=dev,
                     max_new_tokens=min(512, int(cfg.max_seq_len)),
                     global_step=int(state.global_step),
+                    diffusion_lm=False,
                 )
 
         trainer.add_callback(_HFEvalSanity())
 
-    if cfg.resume_checkpoint_path and Path(cfg.resume_checkpoint_path).is_dir():
-        trainer.train(resume_from_checkpoint=cfg.resume_checkpoint_path)
-    else:
-        trainer.train()
-
-
-def run_custom_local(cfg: FinetuneConfig, train_rows: list[dict], val_rows: list[dict]) -> None:
-    """
-    Single-GPU minimal loop. ``custom_model_factory`` must be ``module:fn`` where
-    ``fn(config_dict)`` returns a ``torch.nn.Module`` whose ``forward`` accepts
-    ``input_ids``, ``attention_mask``, and ``labels`` like HuggingFace causal LMs.
-    """
-    if not cfg.custom_model_factory:
-        raise SystemExit("custom_model_factory (e.g. 'mymod.build:build_model') is required for custom_local")
-    import torch
-    from datasets import Dataset
-    from torch.utils.data import DataLoader
-    from transformers import AutoTokenizer
-
-    factory = _import_callable(cfg.custom_model_factory)
-    tok_path = cfg.tokenizer_path or cfg.init_model_path
-    if not tok_path:
-        raise SystemExit("tokenizer_path or init_model_path is required for custom_local tokenization")
-    tok = AutoTokenizer.from_pretrained(tok_path, trust_remote_code=True)
-    if tok.pad_token_id is None:
-        tok.pad_token = tok.eos_token
-
-    def tokenize_batch(examples: dict[str, list]) -> dict[str, list]:
-        return _hf_pair_tokenize_batch(cfg, tok, examples)
-
-    ds_train = Dataset.from_list(train_rows).map(
-        tokenize_batch,
-        batched=True,
-        remove_columns=["text", "target"],
-    )
-    collator = _PackCollator(cfg, tok, cfg.max_seq_len)
-    loader = DataLoader(
-        ds_train,
-        batch_size=max(1, cfg.micro_batch_size),
-        shuffle=True,
-        collate_fn=collator,
-        drop_last=True,
-    )
-
-    model = factory(asdict(cfg))
-    model = model.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
-    try:
-        mcls = f"{model.__class__.__module__}.{model.__class__.__name__}"
-        mc = getattr(model, "cfg", None)
-        print(f"[model] training_class={mcls} custom_cfg={mc}", flush=True)
-    except Exception:
-        pass
-    if cfg.gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
-        model.gradient_checkpointing_enable()
-
-    opt = torch.optim.AdamW(model.parameters(), lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-    device = next(model.parameters()).device
-    model.train()
-
-    # Optional W&B logging (custom_local doesn't use HF Trainer / VeOmni callbacks).
-    wandb = None
-    wandb_active = False
-    try:
-        import os
-
-        if os.environ.get("WANDB_MODE", "").lower() not in {"disabled", "offline"}:
-            import wandb as _wandb  # type: ignore
-
-            wandb = _wandb
-            os.environ.setdefault("WANDB_PROJECT", cfg.wandb_project)
-            run_name = cfg.wandb_run_name or Path(cfg.checkpoint_output_dir).name
-            wandb.init(project=cfg.wandb_project, name=run_name, config=asdict(cfg))
-            wandb_active = True
-    except Exception:
-        wandb = None
-        wandb_active = False
-
-    step = 0
-    max_steps = cfg.max_steps if cfg.max_steps is not None else len(loader) * cfg.num_train_epochs
-    while step < max_steps:
-        for batch in loader:
-            if step >= max_steps:
-                break
-            batch = {k: v.to(device) for k, v in batch.items()}
-            out = model(**batch)
-            if torch.is_tensor(out):
-                loss = out
-            elif isinstance(out, tuple) and torch.is_tensor(out[0]):
-                loss = out[0]
-            else:
-                loss = getattr(out, "loss", None)
-            if loss is None:
-                raise RuntimeError("custom model forward must return a tensor loss or object with .loss")
-            loss.backward()
-            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.max_grad_norm)
-            opt.step()
-            opt.zero_grad()
-            step += 1
-            if step % 10 == 0:
-                print(f"[custom_local] step={step} loss={float(loss.item()):.4f}", flush=True)
-                if wandb_active and wandb is not None:
-                    try:
-                        wandb.log(
-                            {
-                                "train/loss": float(loss.item()),
-                                "train/grad_norm": float(grad_norm.item()) if torch.is_tensor(grad_norm) else float(grad_norm),
-                                "train/lr": float(opt.param_groups[0]["lr"]),
-                            },
-                            step=int(step),
-                        )
-                    except Exception:
-                        pass
-        if cfg.max_steps is not None:
-            break
-    if wandb_active and wandb is not None:
-        try:
-            wandb.finish()
-        except Exception:
-            pass
+    trainer.train()
 
 
 def main() -> None:
@@ -1247,6 +1492,7 @@ def main() -> None:
     raw = _load_yaml(yaml_path)
     cfg = FinetuneConfig.from_dict(raw, str(yaml_path))
     cfg.config_path = str(yaml_path)
+    _finalize_resume_checkpoint_path(cfg)
 
     _maybe_reexec_torchrun(cfg)
 
@@ -1255,8 +1501,36 @@ def main() -> None:
     out_root.mkdir(parents=True, exist_ok=True)
     train_pq = out_root / "prepared_train_pairs.parquet"
     val_pq = out_root / "prepared_val_pairs.parquet"
-    _write_pair_parquet(train_rows, train_pq)
-    _write_pair_parquet(val_rows, val_pq)
+
+    # Under torchrun every rank executes main(); parallel writes to the same parquet paths corrupt files.
+    import time
+
+    import pyarrow.parquet as pq
+
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if world > 1:
+        if local_rank == 0:
+            _write_pair_parquet(train_rows, train_pq)
+            _write_pair_parquet(val_rows, val_pq)
+        else:
+            deadline = time.time() + 600.0
+            while time.time() < deadline:
+                if train_pq.is_file() and val_pq.is_file():
+                    try:
+                        pq.ParquetFile(str(train_pq))
+                        pq.ParquetFile(str(val_pq))
+                        break
+                    except Exception:
+                        pass
+                time.sleep(0.05)
+            else:
+                raise SystemExit(
+                    f"[finetune] rank {local_rank}: timed out waiting for prepared parquets under {out_root}"
+                )
+    else:
+        _write_pair_parquet(train_rows, train_pq)
+        _write_pair_parquet(val_rows, val_pq)
 
     if cfg.model_type == "veomni_supported":
         eval_pq = str(val_pq) if val_rows and cfg.eval_every_steps > 0 else None
@@ -1264,7 +1538,11 @@ def main() -> None:
     elif cfg.model_type == "huggingface":
         run_huggingface(cfg, train_rows, val_rows, str(val_pq))
     elif cfg.model_type == "custom_local":
-        run_custom_local(cfg, train_rows, val_rows)
+        raise SystemExit(
+            "model_type custom_local has been removed. Register your model under "
+            "finetuning/veomni/veomni/models/transformers/ (see VeOmni MODEL_CONFIG_REGISTRY / MODELING_REGISTRY) "
+            "and use model_type veomni_supported with veomni_overrides.model.config_path pointing at your config.json."
+        )
     else:
         raise SystemExit(f"Unknown model_type: {cfg.model_type}")
 

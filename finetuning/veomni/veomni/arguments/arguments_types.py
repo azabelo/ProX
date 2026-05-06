@@ -863,13 +863,6 @@ class ModelArguments:
         default_factory=dict,
         metadata={"help": "Config for lora."},
     )
-    custom_model_factory: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": "Optional `module:callable` factory to construct a torch.nn.Module instead of loading via "
-            "build_foundation_model(). Intended for local/custom research architectures."
-        },
-    )
     ops_implementation: OpsImplementationConfig = field(default_factory=OpsImplementationConfig)
 
     def __post_init__(self):

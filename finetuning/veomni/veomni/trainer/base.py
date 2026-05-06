@@ -237,66 +237,20 @@ class BaseTrainer(Stateful, ABC):
 
     def _build_model(self):
         logger.info_rank0("Build model")
-        custom_factory = getattr(self.args.model, "custom_model_factory", None)
-        if custom_factory:
-            import importlib
-
-            from transformers import AutoConfig
-
-            def _import_callable(spec: str):
-                if ":" not in spec:
-                    raise ValueError("model.custom_model_factory must look like 'package.module:fn'")
-                mod_name, _, attr = spec.partition(":")
-                mod = importlib.import_module(mod_name)
-                fn = getattr(mod, attr, None)
-                if not callable(fn):
-                    raise ValueError(f"{spec!r} is not callable")
-                return fn
-
-            fn = _import_callable(str(custom_factory))
-            # Provide a finetune.py-compatible dict for local research factories.
-            # The finetune script also passes `model.foundation.finetune_config_path` so factories
-            # can read YAML `custom_arch` from the run config.
-            ft_cfg_dict = {
-                "config_path": (self.args.model.foundation or {}).get("finetune_config_path", self.args.model.config_path),
-                "init_model_path": self.args.model.config_path,
-                "tokenizer_path": self.args.model.tokenizer_path,
-                "max_seq_len": self.args.data.max_seq_len,
-            }
-            self.model = fn(ft_cfg_dict)
-            # VeOmni's dataloader/collator will move batches to `self.device`; ensure the
-            # custom model's parameters live on the same device before DDP/FSDP wrapping.
-            try:
-                self.model.to(self.device)
-            except Exception:
-                pass
-            # VeOmni expects `model.config` for downstream plumbing (tokenizer assets, etc.).
-            try:
-                self.model.config = AutoConfig.from_pretrained(self.args.model.config_path, trust_remote_code=True)
-            except Exception:
-                # Minimal stub if HF config isn't available; only a few fields are commonly consumed.
-                self.model.config = AutoConfig()
-        else:
-            self.model = build_foundation_model(
-                config_path=self.args.model.config_path,
-                weights_path=self.args.model.model_path,
-                torch_dtype="float32" if self.args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
-                init_device=self.args.train.init_device,
-                ops_implementation=self.args.model.ops_implementation,
-            )
+        self.model = build_foundation_model(
+            config_path=self.args.model.config_path,
+            weights_path=self.args.model.model_path,
+            torch_dtype="float32" if self.args.train.accelerator.fsdp_config.mixed_precision.enable else "bfloat16",
+            init_device=self.args.train.init_device,
+            ops_implementation=self.args.model.ops_implementation,
+        )
         self.model_config = getattr(self.model, "config", None)
-        # Print the concrete model about to be trained (HF vs custom factory, etc.).
         try:
             cls_path = f"{self.model.__class__.__module__}.{self.model.__class__.__name__}"
             cfg = self.model_config
             model_type = getattr(cfg, "model_type", None) if cfg is not None else None
             archs = getattr(cfg, "architectures", None) if cfg is not None else None
-            extra = ""
-            if hasattr(self.model, "cfg"):
-                extra = f" custom_cfg={getattr(self.model, 'cfg', None)}"
-            logger.info_rank0(
-                f"[model] training_class={cls_path} model_type={model_type} architectures={archs}{extra}"
-            )
+            logger.info_rank0(f"[model] training_class={cls_path} model_type={model_type} architectures={archs}")
         except Exception:
             pass
 

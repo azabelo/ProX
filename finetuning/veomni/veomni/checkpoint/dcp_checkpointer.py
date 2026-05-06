@@ -49,6 +49,42 @@ logger = logging.get_logger(__name__)
 _EXTRA_STATE_FORMAT = "extra_state_rank_{}.pt"
 
 
+def _patch_torch_dcp_wrap_exception_for_python_313() -> None:
+    """Make DCP exception aggregation pickle-safe on Python 3.13+.
+
+    ``torch.distributed`` gathers per-rank planner steps via ``gather_object`` → pickle.
+    Python 3.13 stores bytecode on ``traceback.FrameSummary._code``, which pickle rejects.
+    If any rank fails while building a load plan, wrapped tracebacks then break *all* ranks
+    with ``TypeError: cannot pickle code objects`` (masking the real error).
+
+    Mirrors upstream PyTorch (``torch.distributed.checkpoint.api._wrap_exception``, #177713).
+    """
+    import sys
+    import traceback as tb
+
+    if sys.version_info < (3, 13):
+        return
+
+    try:
+        from torch.distributed.checkpoint import api as _dcp_api
+        from torch.distributed.checkpoint import utils as _dcp_utils
+    except ImportError:
+        return
+
+    def _wrap_exception_fixed(exc: BaseException):
+        summary = tb.extract_tb(exc.__traceback__)
+        for frame in summary:
+            if hasattr(frame, "_code"):
+                object.__setattr__(frame, "_code", None)
+        return (exc, summary)
+
+    _dcp_api._wrap_exception = _wrap_exception_fixed  # type: ignore[assignment]
+    _dcp_utils._wrap_exception = _wrap_exception_fixed  # type: ignore[assignment]
+
+
+_patch_torch_dcp_wrap_exception_for_python_313()
+
+
 def _load_dcp_into_state_dict_local(state_dict, checkpoint_path: str) -> None:
     """Load DCP tensors into ``state_dict`` without requiring a process group when possible.
 
@@ -347,8 +383,18 @@ class DistributedCheckpointer(CheckpointerBase):
     """
 
     save_future: Optional[Any] = None
-    # Dedicated process group for async saves (created on first use)
-    _async_process_group: Optional[Any] = None
+    # Gloo group for DCP planning/object collectives (created on first use).
+    # Using the default NCCL process group makes gather_object stage pickled SavePlans on
+    # CUDA; a bad max size can surface as a bogus multi-exabyte CUDA OOM at resize_.
+    _dcp_gloo_process_group: Optional[Any] = None
+
+    @classmethod
+    def _dcp_coord_process_group(cls):
+        if not dist.is_available() or not dist.is_initialized():
+            return None
+        if cls._dcp_gloo_process_group is None:
+            cls._dcp_gloo_process_group = dist.new_group(backend="gloo")
+        return cls._dcp_gloo_process_group
 
     @classmethod
     def save(
@@ -425,10 +471,11 @@ class DistributedCheckpointer(CheckpointerBase):
         if storage_reader is None:
             storage_reader = cls._create_storage_reader(checkpoint_dir)
 
+        coord_pg = process_group if process_group is not None else cls._dcp_coord_process_group()
         dcp.load(
             state_dict=load_state,
             storage_reader=storage_reader,
-            process_group=process_group,
+            process_group=coord_pg,
         )
         # Note: further per-param DTensor alignment and device fixes happen inside OptimizerState.load_state_dict
 
@@ -446,11 +493,8 @@ class DistributedCheckpointer(CheckpointerBase):
         save_async: bool,
     ) -> None:
         """Execute DCP save with optional async support."""
+        coord_pg = cls._dcp_coord_process_group()
         if save_async:
-            # Lazily create a dedicated Gloo process group for async DCP saves
-            if cls._async_process_group is None:
-                cls._async_process_group = dist.new_group(backend="gloo")
-
             if cls.save_future is not None:
                 logger.info(f"[RANK {dist.get_rank()}] waiting for previous DCP saving session to end...")
                 cls.save_future.result()
@@ -461,13 +505,16 @@ class DistributedCheckpointer(CheckpointerBase):
             cls.save_future = dcp.async_save(
                 state_dict=save_state,
                 storage_writer=storage_writer,
-                process_group=cls._async_process_group,
+                process_group=coord_pg,
             )
         else:
-            dcp.save(
+            save_kw: Dict[str, Any] = dict(
                 state_dict=save_state,
                 storage_writer=storage_writer,
             )
+            if coord_pg is not None:
+                save_kw["process_group"] = coord_pg
+            dcp.save(**save_kw)
             if dist.is_initialized():
                 dist.barrier()
             gc.collect()

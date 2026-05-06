@@ -1,0 +1,85 @@
+# VeOmni + ``qwen2_swa``: ``build_foundation_model`` (no ``custom_model_factory``).
+#
+# Random-init transformer (architecture in ``model_config`` below; SWA on listed layers).
+# Tokenizer from Hugging Face (same as Qwen2.5-0.5B); no checkpoint weights loaded (``model_path: null``).
+#
+# Run from repo root:
+#   PYTHONPATH=finetuning/veomni python finetuning/finetune.py finetuning/example_finetune_veomni_qwen2_swa.yaml
+
+model_arch: auto
+model_type: veomni_supported
+
+# Not used for weights when ``veomni_overrides.model.model_path`` is null.
+init_model_path: ""
+
+tokenizer_path: Qwen/Qwen2.5-0.5B
+
+resume_checkpoint_path: null
+
+inputs_dir_path: data/raw/DCLM-baseline-one-shard/global-shard_01_of_10/local-shard_0_of_10
+outputs_dir_path: openrouter_output_data/rewrite/1000docs
+
+dataset_type: dclm
+chunk_size: 1000
+is_code: false
+packing: false
+include_loss_from_input: false
+ensure_eos_on_target: true
+
+num_gpus: 1
+num_validation_documents: 50
+
+max_seq_len: 512
+max_steps: 20
+num_train_epochs: 1
+micro_batch_size: 1
+global_batch_size: 1
+learning_rate: 2e-5
+warmup_ratio: 0.03
+weight_decay: 0.0
+max_grad_norm: 1.0
+lr_decay_style: cosine
+gradient_checkpointing: false
+
+eval_every_steps: 20
+eval_max_batches: 10
+save_every_steps: 10000
+
+wandb_project: prox-finetune
+wandb_run_name: veomni-qwen2-swa-random-init
+
+checkpoint_output_dir: ./finetuning_outputs/veomni_qwen2_swa_random_init
+
+custom_arch: {}
+
+model_config:
+  architectures: [Qwen2ForCausalLM]
+  attention_dropout: 0.0
+  bos_token_id: 151643
+  eos_token_id: 151643
+  hidden_act: silu
+  hidden_size: 896
+  initializer_range: 0.02
+  intermediate_size: 4864
+  max_position_embeddings: 32768
+  max_window_layers: 24
+  model_type: qwen2_swa
+  num_attention_heads: 14
+  num_hidden_layers: 24
+  num_key_value_heads: 2
+  rms_norm_eps: 1.0e-06
+  rope_theta: 1000000.0
+  sliding_window: 32768
+  tie_word_embeddings: true
+  torch_dtype: bfloat16
+  use_cache: true
+  use_mrope: false
+  use_sliding_window: false
+  vocab_size: 151936
+  swa_layer_indices: [12]
+  swa_sliding_window: 128
+
+veomni_overrides:
+  model:
+    model_path: null
+    tokenizer_path: Qwen/Qwen2.5-0.5B

@@ -1,0 +1,82 @@
+# Random-init ``test_everything`` stack (attention → SWA → MoE → Mamba-like → DeltaNet-like → shared attention).
+# Loaded only via VeOmni ``build_foundation_model`` — no ``custom_model_factory``.
+#
+# From repo root:
+#   python finetuning/finetune.py finetuning/example_finetune_veomni_test_everything.yaml
+
+model_arch: auto
+model_type: veomni_supported
+
+init_model_path: ""
+
+tokenizer_path: Qwen/Qwen2.5-0.5B
+
+# resume_checkpoint_path: null
+resume_checkpoint_path: ./finetuning_outputs/veomni_test_everything/checkpoints/global_step_200
+
+inputs_dir_path: data/raw/DCLM-baseline-one-shard/global-shard_01_of_10/local-shard_0_of_10
+outputs_dir_path: openrouter_output_data/rewrite/1000docs
+
+dataset_type: dclm
+chunk_size: 1000
+is_code: false
+packing: false
+include_loss_from_input: false
+ensure_eos_on_target: true
+
+num_gpus: 8
+num_validation_documents: 50
+
+max_seq_len: 256
+max_steps: 130
+num_train_epochs: 1
+micro_batch_size: 1
+# VeOmni requires global_batch_size % (micro_batch_size * data_parallel_size) == 0; with 8 GPUs and default DDP, use a multiple of 8.
+global_batch_size: 8
+learning_rate: 2e-5
+warmup_ratio: 0.03
+weight_decay: 0.0
+max_grad_norm: 1.0
+lr_decay_style: cosine
+gradient_checkpointing: false
+
+eval_every_steps: 130
+eval_max_batches: 10
+save_every_steps: 20
+
+wandb_project: prox-finetune
+wandb_run_name: veomni-test-everything
+
+checkpoint_output_dir: ./finetuning_outputs/veomni_test_everything
+
+custom_arch: {}
+
+# Same fields as a HF ``config.json`` (written under ``checkpoint_output_dir/.finetune_inline_config/`` at run time).
+model_config:
+  architectures: [TestEverythingForCausalLM]
+  model_type: test_everything
+  vocab_size: 151936
+  hidden_size: 256
+  num_hidden_layers: 6
+  num_attention_heads: 8
+  intermediate_size: 512
+  sliding_window: 32
+  # Must match existing DCP checkpoints (e.g. global_step_100 has router [num_experts, hidden]).
+  num_experts: 4
+  num_experts_per_tok: 4
+  norm_topk_prob: false
+  mamba_d_inner: 128
+  mamba_d_state: 16
+  mamba_d_conv: 4
+  delta_kernel_size: 3
+  rope_theta: 10000.0
+  max_position_embeddings: 2048
+  rms_norm_eps: 1.0e-6
+  attention_dropout: 0.0
+  tie_word_embeddings: false
+  torch_dtype: float32
+
+veomni_overrides:
+  model:
+    model_path: null
+    tokenizer_path: Qwen/Qwen2.5-0.5B

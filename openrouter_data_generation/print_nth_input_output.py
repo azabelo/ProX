@@ -110,24 +110,22 @@ def load_input_output_for_yaml_row(
     os.chdir(_REPO_ROOT)
     cfg_path = yaml_config.expanduser().resolve()
     raw = roc.load_yaml_config(cfg_path)
-    cfg = roc.parse_config(raw)
+    vp = roc.parse_view_paths(raw)
 
-    all_shards = roc.sorted_shard_paths(cfg.data_parquet_dir)
+    all_shards = roc.sorted_shard_paths(vp.data_parquet_dir)
     if not all_shards:
-        raise SystemExit(f"No .parquet or *.jsonl.zst under {cfg.data_parquet_dir}")
-    if cfg.max_parquets >= 0:
-        shard_paths = all_shards[: cfg.max_parquets]
+        raise SystemExit(f"No .parquet or *.jsonl.zst under {vp.data_parquet_dir}")
+    if vp.max_parquets >= 0:
+        shard_paths = all_shards[: vp.max_parquets]
     else:
         shard_paths = all_shards
 
     idx = n - 1 if one_based else n
     shard_path, local_i = _resolve_shard_and_local(shard_paths, idx, roc)
 
-    out_path = (cfg.data_output_dir / f"{shard_path.stem}_openrouter.parquet").resolve()
-    if not out_path.is_file():
-        raise FileNotFoundError(f"Output parquet not found (run the chunked job first): {out_path}")
+    out_path = roc.resolve_view_output_parquet(vp.data_output_dir, shard_path.stem)
 
-    row_text_fn = roc.get_row_text_fn(cfg.data_parquet_type)
+    row_text_fn = roc.get_row_text_fn(vp.data_parquet_type)
     in_row = _nth_row_shard(shard_path, local_i, roc)
     out_row = _nth_row_parquet(out_path, local_i)
     source_text = row_text_fn(in_row)

@@ -57,6 +57,14 @@ class CheckpointerCallback(Callback):
                     f"already saved at step_end)."
                 )
 
+    def on_train_end(self, state: TrainerState, **kwargs) -> None:
+        """Always persist the final training step if it was not already saved (e.g. save_steps not reached)."""
+        if state.global_step > 0 and state.global_step != self._last_saved_step:
+            logger.info_rank0(
+                f"Saving final checkpoint at global_step_{state.global_step} (train end; not aligned with save_steps)."
+            )
+            self._save_checkpoint(state)
+
     def on_train_begin(self, state: TrainerState, **kwargs) -> None:
         self._load_checkpoint()
 

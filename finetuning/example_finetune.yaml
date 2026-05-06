@@ -7,13 +7,16 @@
 #   torchrun --standalone --nproc_per_node=8 finetuning/finetune.py finetuning/example_finetune.yaml
 
 model_arch: auto
-model_type: veomni_supported  # veomni_supported | huggingface | custom_local
+model_type: veomni_supported  # veomni_supported | huggingface
 
 init_model_path: Qwen/Qwen2.5-0.5B
 tokenizer_path: null  # defaults to init_model_path
 
-# VeOmni DCP checkpoint dir for full resume (optimizer + scheduler), e.g. .../checkpoints/global_step_1000
-resume_checkpoint_path: null
+# VeOmni DCP resume: directory must contain ``.metadata`` (e.g. .../checkpoints/global_step_130).
+# Relative paths resolve from this YAML file's directory. With save_every_steps: 500 and max_steps: 130,
+# periodic saves never fire; the train-end checkpoint is ``global_step_130``, not global_step_100.
+# resume_checkpoint_path: null
+resume_checkpoint_path: /home/ubuntu/ProX/finetuning_outputs/example_run/checkpoints/global_step_30
 
 # Match openrouter_data_generation run (e.g. openrouter_output_data/rewrite/1000docs/example_openrouter_rewrite.yaml)
 inputs_dir_path: data/raw/DCLM-baseline-one-shard/global-shard_01_of_10/local-shard_0_of_10
@@ -29,11 +32,11 @@ include_loss_from_input: false
 # Append tokenizer EOS to each target when missing so CE can supervise EOS as last assistant token.
 ensure_eos_on_target: true
 
-num_gpus: 1
+num_gpus: 8
 num_validation_documents: 50
 
 max_seq_len: 2048
-max_steps: 50
+max_steps: 201
 num_train_epochs: 1  # VeOmni uses max_steps when set (caps steps per epoch)
 global_batch_size: 8
 micro_batch_size: 1
@@ -45,7 +48,7 @@ lr_decay_style: cosine
 max_grad_norm: 1.0
 
 save_every_steps: 500
-eval_every_steps: 50  # set > 0 to run periodic val loss (VeOmni: rank 0 only)
+eval_every_steps: 201 # > 0: parquet val CE / sanity on rank 0; multi-GPU uses barriers so ranks stay in sync
 eval_max_batches: 20
 
 checkpoint_output_dir: ./finetuning_outputs/example_run
@@ -55,9 +58,6 @@ wandb_project: prox-finetune
 wandb_run_name: null
 
 gradient_checkpointing: true
-
-# custom_local only: "module.path:build_fn" — fn receives config dict from this YAML
-custom_model_factory: null
 
 # Deep-merge into VeOmniArguments (optional)
 veomni: {}

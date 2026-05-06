@@ -1,0 +1,62 @@
+# Example: ``test_everything`` finetune (step 100) as a VeOmni DCP path.
+#
+# On first run, DCP is merged to HuggingFace under
+#   ``<model_checkpoint_path>/hf_ckpt/``
+# using the same run's ``.finetune_inline_config/config.json`` (from finetune).
+#
+# Requires: conda env with vLLM + CUDA (this repo: ``conda activate refining``). Install helpers into the env:
+# ``pip install -r refiner_data_generation/requirements_denoise_conda.txt``
+# If you see ``numpy.dtype size changed`` / sklearn errors, ``~/.local`` was shadowing the env
+# (``denoise_dataset.py`` now drops user-site from ``sys.path``; keep deps in the env only).
+# Custom VeOmni ``model_type`` needs ``trust_remote_code: true``; this script adds ``finetuning/veomni``.
+#
+# Run from repo root:
+#   python refiner_data_generation/denoise_dataset.py refiner_data_generation/example_denoise.yaml
+# After ``pip install -r refiner_data_generation/requirements_denoise_conda.txt``, check imports:
+#   python refiner_data_generation/verify_imports.py
+
+
+input_parquet_dir: data/raw/DCLM-baseline-one-shard/global-shard_01_of_10/local-shard_0_of_10
+dataset_type: dclm
+
+output_data_dir: refiner_output_data/example_denoise_run
+overwrite: true
+continue: false
+
+chunk_size: 1000
+is_code: false
+
+# Informational; test stack reg name
+model_arch: TestEverythingForCausalLM
+
+# VeOmni training output (DCP). After merge, weights live under .../global_step_100/hf_ckpt/
+model_checkpoint_path: /home/ubuntu/ProX/finetuning_outputs/example_run/checkpoints/global_step_201
+
+# DCP merge does not embed tokenizer files — use the same tokenizer as finetune.yaml
+tokenizer_path: Qwen/Qwen2.5-0.5B
+
+# Tensor-parallel size per vLLM engine. Must divide the model's attention head count
+# (Qwen2.5-0.5B has 14 heads → valid values are 1, 2, 7, 14 — not 8).
+num_gpus: 1
+# Data-parallel: N separate full models, one GPU each when num_gpus: 1. Shards are
+# split round-robin across workers (e.g. replica 0 → shards 0, N, 2N, …). Set to 1 for
+# a single process. Example for 8 GPUs: num_gpus: 1 and data_parallel_replicas: 8
+data_parallel_replicas: 8
+# Optional: pin physical GPU indices (length must equal data_parallel_replicas)
+# data_parallel_gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+
+max_docs: 100
+max_chars: 10000
+max_chunks: -1
+max_tokens: -1
+max_parquets: 1
+
+chunk_batch_size: 32
+max_new_tokens: 4096
+# Keep within the finetuned model's context (test_everything example uses 2048 in model_config)
+max_model_len: 2048
+trust_remote_code: true
+
+metrics_interval_sec: 15.0
+
+vllm: {}

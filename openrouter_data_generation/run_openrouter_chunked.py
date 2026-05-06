@@ -67,9 +67,25 @@ except ImportError as e:  # pragma: no cover
 
 import pyarrow as pa
 import pyarrow.parquet as pq
-import zstandard as zstd
 
 API_URL = "https://openrouter.ai/api/v1/chat/completions"
+
+_zstandard_mod: Any = None
+
+
+def _get_zstandard():
+    """Lazy import: only ``*.jsonl.zst`` shards need ``zstandard`` (not plain ``*.parquet``)."""
+    global _zstandard_mod
+    if _zstandard_mod is None:
+        try:
+            import zstandard as zstd  # noqa: PLC0415
+
+            _zstandard_mod = zstd
+        except ImportError as e:  # pragma: no cover
+            raise SystemExit(
+                "zstandard is required for *.jsonl.zst shards (not for *.parquet): pip install zstandard"
+            ) from e
+    return _zstandard_mod
 
 # Delimiter between per-chunk model outputs (rewrite ``text`` and code ``programs_delimited``).
 PROGRAM_CHUNK_SEPARATOR = "\n\n### OPENROUTER_CHUNK_PROGRAM ###\n\n"
@@ -192,6 +208,7 @@ def _is_jsonl_zst(path: Path) -> bool:
 
 
 def _count_jsonl_zst_lines(path: Path) -> int:
+    zstd = _get_zstandard()
     dctx = zstd.ZstdDecompressor()
     n = 0
     buf = b""
@@ -213,6 +230,7 @@ def _count_jsonl_zst_lines(path: Path) -> int:
 
 
 def iter_jsonl_zst_rows(path: Path) -> Iterator[dict[str, Any]]:
+    zstd = _get_zstandard()
     dctx = zstd.ZstdDecompressor()
     buf = b""
     with path.open("rb") as f, dctx.stream_reader(f) as reader:
@@ -689,6 +707,60 @@ def parse_config(raw: dict[str, Any]) -> RunConfig:
         x_title=x_title,
         continue_run=continue_run,
     )
+
+
+@dataclass(frozen=True)
+class ViewPaths:
+    """Subset of config for viewers (no OpenRouter API / concurrency keys)."""
+
+    data_parquet_dir: Path
+    data_parquet_type: str
+    data_output_dir: Path
+    max_parquets: int
+
+
+def parse_view_paths(raw: dict[str, Any]) -> ViewPaths:
+    """
+    Fields needed to map a global row index to an input shard row and the matching output parquet.
+
+    Accepts OpenRouter names (``data_parquet_dir``, ``data_output_dir``, …) and refiner/denoise
+    aliases (``input_parquet_dir``, ``output_data_dir``, ``dataset_type``).
+    """
+    dp = raw.get("data_parquet_dir") or raw.get("input_parquet_dir")
+    if dp is None:
+        raise SystemExit(
+            "YAML must include data_parquet_dir or input_parquet_dir (input shard directory)."
+        )
+    out = raw.get("data_output_dir") or raw.get("output_data_dir")
+    if out is None:
+        raise SystemExit(
+            "YAML must include data_output_dir or output_data_dir (output directory)."
+        )
+    dtype = raw.get("data_parquet_type") or raw.get("dataset_type") or "fineweb"
+    max_parquets = int(raw.get("max_parquets", -1))
+    return ViewPaths(
+        data_parquet_dir=Path(os.path.expanduser(str(dp))).resolve(),
+        data_parquet_type=str(dtype),
+        data_output_dir=Path(os.path.expanduser(str(out))).resolve(),
+        max_parquets=max_parquets,
+    )
+
+
+def resolve_view_output_parquet(output_dir: Path, shard_stem: str) -> Path:
+    """
+    Output shard file written by ``run_openrouter_chunked`` or ``refiner_data_generation/denoise_dataset``.
+
+    Prefers ``{{stem}}_openrouter.parquet``, then ``{{stem}}_denoised.parquet``.
+    """
+    candidates = [
+        output_dir / f"{shard_stem}_openrouter.parquet",
+        output_dir / f"{shard_stem}_denoised.parquet",
+    ]
+    for p in candidates:
+        if p.is_file():
+            return p.resolve()
+    tried = ", ".join(str(c) for c in candidates)
+    raise FileNotFoundError(f"Output parquet not found (run the pipeline first). Tried: {tried}")
 
 
 def precount_doc_rows(shard_paths: list[Path]) -> int:

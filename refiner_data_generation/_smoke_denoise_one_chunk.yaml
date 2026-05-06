@@ -1,0 +1,35 @@
+# Ephemeral smoke config (1 chunk, tiny generation). Not for production.
+# Use: ``conda activate refining`` (or your CUDA-matched vLLM env), then
+# ``python refiner_data_generation/denoise_dataset.py refiner_data_generation/_smoke_denoise_one_chunk.yaml``
+input_parquet_dir: refiner_output_data/_smoke_in
+dataset_type: dclm
+
+output_data_dir: refiner_output_data/_denoise_smoke_one_chunk
+overwrite: true
+continue: false
+
+chunk_size: 1000
+is_code: false
+
+model_arch: Qwen2ForCausalLM
+
+model_checkpoint_path: /home/ubuntu/ProX/finetuning_outputs/example_run/checkpoints/global_step_30
+tokenizer_path: Qwen/Qwen2.5-0.5B
+
+num_gpus: 1
+
+max_docs: 1
+max_chars: -1
+max_chunks: 1
+max_tokens: -1
+max_parquets: 1
+
+chunk_batch_size: 1
+max_new_tokens: 32
+max_model_len: 2048
+trust_remote_code: true
+
+metrics_interval_sec: 3600.0
+
+vllm:
+  enforce_eager: true

@@ -1,0 +1,36 @@
+# Install into the conda env you use for ``denoise_dataset.py`` (CUDA-matching vLLM).
+# Recommended on this repo: ``conda activate refining`` (CUDA 12.x + working vLLM).
+#
+# ``denoise_dataset.py`` strips PEP-370 user-site (``~/.local``) from ``sys.path``, so every
+# dependency must live *inside* the conda env—never rely on ``pip install --user``.
+#
+#   conda activate refining   # or your vLLM env
+#   pip install -r refiner_data_generation/requirements_denoise_conda.txt
+#
+# If pip says satisfied under ``~/.local``, force into the env:
+#   pip install --ignore-installed pyarrow regex safetensors psutil ...
+#
+# ``denoise_dataset`` runs DCP→HF merge in a **subprocess** (see PROX_DCP_MERGE_PYTHON). That
+# subprocess needs PyTorch≥2.4 (for ``torch.distributed.checkpoint.load``) and Transformers/VeOmni
+# compatibility (~4.52+). Your vLLM env may stay on older pins for inference-only.
+#
+# For a **single** env that both merges and runs vLLM, align torch/transformers with vLLM’s docs;
+# otherwise point PROX_DCP_MERGE_PYTHON at a VeOmni-capable ``python``.
+
+numpy>=1.26,<2
+scipy>=1.10
+scikit-learn>=1.3
+regex
+pyyaml
+pyarrow
+psutil
+sentencepiece
+msgpack
+protobuf>=3.20,<5
+tiktoken>=0.6.0
+transformers>=4.52.0,<5
+tokenizers>=0.19.1
+huggingface-hub>=0.23.5,<1
+safetensors>=0.4.1
+# Only for ``*.jsonl.zst`` shards (not ``*.parquet``); lazy-imported.
+zstandard
