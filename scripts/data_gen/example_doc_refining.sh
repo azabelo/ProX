@@ -1,4 +1,7 @@
 #!/bin/bash
+# Example Slurm launcher for doc-level refining (see README "Large Scale Data Refining").
+# Fill in #SBATCH lines and site setup_* / $TINYLM_* paths. Uses conda env: refining.
+# Point --config_path at a YAML whose data_path/save_path match your corpus.
 #SBATCH --job-name=prox_doc_refining_xs
 #SBATCH --output=<expected_output_file>
 #SBATCH --partition=<your_partition>

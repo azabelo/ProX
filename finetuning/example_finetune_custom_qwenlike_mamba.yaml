@@ -1,0 +1,61 @@
+# Train a Qwen-like stack where *one* block uses a gated causal conv + selective SSM (Mamba-style) instead of GQA.
+# See ``my_architectures/qwen_like_one_mamba_layer.py``.
+#
+#   python finetuning/finetune.py finetuning/example_finetune_custom_qwenlike_mamba.yaml
+#
+# Same caveats as the SWA custom example: ``custom_local`` minimal loop (single GPU stub; no ckpt/eval hooks yet).
+# Inner SSM dimension ``mamba_d_inner`` caps projection size vs full hidden×state product.
+
+model_arch: custom_qwenlike_one_mamba
+model_type: custom_local
+custom_model_factory: my_architectures.qwen_like_one_mamba_layer:build_model
+
+init_model_path: Qwen/Qwen2.5-0.5B
+tokenizer_path: null
+
+resume_checkpoint_path: null
+
+inputs_dir_path: data/raw/DCLM-baseline-one-shard/global-shard_01_of_10/local-shard_0_of_10
+outputs_dir_path: openrouter_output_data/rewrite/1000docs
+
+dataset_type: dclm
+chunk_size: 1000
+is_code: false
+packing: false
+include_loss_from_input: false
+ensure_eos_on_target: true
+
+num_gpus: 1
+num_validation_documents: 50
+
+max_seq_len: 512
+max_steps: 200
+num_train_epochs: 1
+global_batch_size: 8
+micro_batch_size: 1
+
+learning_rate: 3.0e-4
+weight_decay: 0.01
+warmup_ratio: 0.03
+lr_decay_style: cosine
+max_grad_norm: 1.0
+
+save_every_steps: 500
+eval_every_steps: 0
+eval_max_batches: 20
+
+checkpoint_output_dir: ./finetuning_outputs/custom_qwenlike_mamba_run
+
+seed: 42
+wandb_project: prox-finetune
+wandb_run_name: custom-qwenlike-one-mamba
+
+gradient_checkpointing: false
+
+custom_arch:
+  mamba_layer_index: 12
+  mamba_d_inner: 512
+  mamba_d_state: 16
+  mamba_d_conv: 4
+
+veomni: {}

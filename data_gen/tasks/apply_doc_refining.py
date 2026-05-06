@@ -11,6 +11,7 @@ from utils.doc_utils import execute_meta_operations
 from vllm import LLM, SamplingParams
 
 from data_gen.configs import GentaskConfig
+from data_gen.utils.hf_tokenizer import load_auto_tokenizer_fast_fallback
 
 random.seed(42)
 
@@ -18,7 +19,15 @@ random.seed(42)
 # dummy env constants for multi-gpu & multi-node
 NODE_GPUS = int(os.environ.get("NODE_GPUS", 8))
 NODE_RANK = int(os.environ.get("NODE_RANK", 0))
-CUDA_DEVICE = int(os.environ["CUDA_VISIBLE_DEVICES"])
+def _cuda_visible_device_index() -> int:
+    raw = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
+    first = raw.split(",")[0].strip()
+    if first.lower() in ("", "none"):
+        return 0
+    return int(first)
+
+
+CUDA_DEVICE = _cuda_visible_device_index()
 TOTAL_SPLIT = int(os.environ["TOTAL_SPLIT"])
 
 
@@ -26,7 +35,12 @@ def main(args):
     # load config
     config = GentaskConfig().from_yaml(args.config_path)
     tokenizer = AutoTokenizer.from_pretrained(args.token_template, use_fast=False)
-    base_tokenizer = AutoTokenizer.from_pretrained(args.model_path)
+    base_tokenizer, tokenizer_slow_fallback = load_auto_tokenizer_fast_fallback(args.model_path)
+    if tokenizer_slow_fallback:
+        print(
+            "Fast tokenizer unavailable for model_path; using slow tokenizer and vLLM tokenizer_mode=slow.",
+            flush=True,
+        )
     tokenizer.bos_token = base_tokenizer.bos_token
     tokenizer.eos_token = base_tokenizer.eos_token
 
@@ -65,6 +79,8 @@ def main(args):
     sampling_params = SamplingParams(temperature=0.0, top_p=0.9, max_tokens=2000)
     engine = LLM(
         model=args.model_path,
+        tokenizer_mode="slow" if tokenizer_slow_fallback else "auto",
+        trust_remote_code=True,
         gpu_memory_utilization=0.9,
         tensor_parallel_size=tp_size,
     )

@@ -1,0 +1,5 @@
+# Chunk refining on doc-level FineWeb output (2nd stage). Pair with apply_doc_refining_fineweb_local.yaml.
+data_path: /home/ubuntu/ProX/data/raw/doc_refining_fineweb_8gpu
+save_path: /home/ubuntu/ProX/data/raw/chunk_refining_fineweb_post_doc
+save_name: prox
+save_interval: 100000

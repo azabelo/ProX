@@ -177,3 +177,7 @@ wandb
 eval_analysis
 
 *.DS_Store
+
+# Large local training outputs (not suitable for git)
+finetuning_outputs/
+finetuning_refiner/

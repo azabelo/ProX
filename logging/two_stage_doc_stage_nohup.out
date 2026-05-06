@@ -1,0 +1,2 @@
+TOTAL_SPLIT=8 NGPU=8 LIMIT=-1
+All workers finished. Logs under logging/apply_doc_refining_*.log

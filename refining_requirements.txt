@@ -1,3 +1,10 @@
+# Install PyTorch with CUDA 12.4 wheels first (same as repo root):
+#   bash scripts/install_pytorch_cu124.sh
+# so vLLM can see your GPUs (avoid default PyPI torch+cu130 on driver-limited hosts).
+#
+# flash-attn source builds need nvcc >= 11.6 (e.g. conda: cuda-nvcc=12.1 -c nvidia).
+# setuptools>=82 drops pkg_resources; torch 2.1 cpp_extension still imports it — pin below.
+setuptools>=69,<81
 accelerate>=0.27.2
 datasets>=2.14.3
 matplotlib>=3.7.0

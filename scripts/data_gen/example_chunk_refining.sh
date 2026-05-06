@@ -1,4 +1,9 @@
 #!/bin/bash
+# Example Slurm launcher for chunk-level refining (see README "Large Scale Data Refining").
+# Fill in #SBATCH lines and site setup_* / $TINYLM_* paths. Uses conda env: refining.
+# Point --config_path at a YAML whose data_path/save_path match your corpus (e.g. fineweb:
+# data_gen/configs/apply_chunk_refining_fineweb_first_parquet.yaml). Non-Slurm helper:
+# scripts/data_gen/run_chunk_refining_fineweb_first_parquet.sh
 #SBATCH --job-name=prox_chunk_refining_xs
 #SBATCH --output=<expected_output_file>
 #SBATCH --partition=<your_partition>

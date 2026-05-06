@@ -1,0 +1,8 @@
+# Same FineWeb shard + chunk-refining IO as apply_chunk_refining_fineweb_first_parquet.yaml,
+# but writes under chunk_refining_fineweb_first_parquet_ft so runs do not overwrite the
+# baseline Prox-LM outputs. Use MODEL pointing at HF-exported finetuned weights (see
+# scripts/data_gen/run_chunk_refining_fineweb_first_parquet_ft_model.sh).
+data_path: /home/ubuntu/ProX/data/raw/HuggingFaceFW/fineweb/sample/10BT
+save_path: /home/ubuntu/ProX/data/raw/chunk_refining_fineweb_first_parquet_ft
+save_name: prox
+save_interval: 100000

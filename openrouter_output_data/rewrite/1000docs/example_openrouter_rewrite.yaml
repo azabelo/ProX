@@ -1,0 +1,49 @@
+# Example config for openrouter_data_generation/run_openrouter_chunked.py
+#
+# Run:
+#   export OPENROUTER_API_KEY=sk-or-...
+#   python openrouter_data_generation/run_openrouter_chunked.py openrouter_data_generation/example_openrouter_rewrite.yaml
+
+model: openai/gpt-oss-120b
+
+# Any other top-level keys are forwarded to OpenRouter's chat/completions JSON body
+# (e.g. temperature, top_p, seed, ...). Use ``openrouter:`` for the API completion cap:
+temperature: 1.0
+openrouter:
+  max_tokens: 4096
+  reasoning:
+    effort: low 
+
+# Optional: top-level ``max_tokens`` is RESERVED for metrics only (denominator
+# min(max_tokens, estimated tokens in selected parquets)). Omit or set -1 to use
+# only the parquet estimate. Per-request completion limit stays under ``openrouter:``.
+
+num_concurrent: 1024
+metrics_interval_sec: 10.0
+
+prompt_path: openrouter_data_generation/example_prompt_rewrite.txt
+
+# DCLM baseline one shard (jsonl.zst), e.g. after my_Scripts/download_dclm_baseline_one_shard.py
+data_parquet_dir: data/raw/DCLM-baseline-one-shard/global-shard_01_of_10/local-shard_0_of_10
+# One of: fineweb | dclm | redpajama | redpajama-v2 | passthrough
+data_parquet_type: dclm
+
+chunk_size: 1000
+max_chars: 10000000
+max_docs: 1000
+max_parquets: 2
+
+# Output is always a directory; shard parquets are written inside it.
+# Convention for ``output_is_code: true``: use a subfolder under ``openrouter_output_data/code/``.
+data_output_dir: openrouter_output_data/rewrite/1000docs
+allow_output_overwrite: true
+# Resume in-place when output-affecting YAML matches the copy in data_output_dir (see runner doc).
+continue: true
+# Typo alias also accepted: allow_outpute_overwrite
+
+# false = reformatted text per chunk; merged into ``text`` in order with OPENROUTER_CHUNK_PROGRAM delimiters.
+# true = model returns a short program per chunk; programs are stored as a list plus a delimited string.
+output_is_code: false
+
+# http_referer: https://github.com/GAIR-NLP/ProX
+# x_title: prox-openrouter-chunked

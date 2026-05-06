@@ -165,7 +165,7 @@ We released 2 families of refining models:
 - WebRefining-LM: for general web domain, including [web-doc-refining-lm](https://huggingface.co/gair-prox/web-doc-refining-lm) and [web-chunk-refining-lm](https://huggingface.co/gair-prox/web-chunk-refining-lm)
 - MathRefining-LM: for math domain, including [math-doc-refining-lm](https://huggingface.co/gair-prox/math-doc-refining-lm) and [math-chunk-refining-lm](https://huggingface.co/gair-prox/math-chunk-refining-lm)
 
-You can refer to the following example slurm scripts to refine large scale pre-training data.
+You can refer to the following example Slurm scripts to refine large scale pre-training data.
 
 ```bash
 # 1. doc-level refining
@@ -174,6 +174,25 @@ sbatch scripts/data_gen/example_doc_refining.sh
 # 2. chunk-level refining
 sbatch scripts/data_gen/example_chunk_refining.sh
 ```
+
+Before `sbatch`, edit the `#SBATCH` lines in each script (partition, log paths, wall time, nodes/GPUs). The scripts expect `setup_personal_env.sh`, `setup_common_env.sh`, and `$TINYLM_CONDA_DIR` / `$TINYLM_WORK_DIR` to match your cluster. Use the **`refining`** conda env (see above). Set **`data_path`** and **`save_path`** in the YAML you pass as `--config_path` (the stock `apply_doc_refining.yaml` / `apply_chunk_refining.yaml` use placeholders such as `${RAW_DATA_DIR}/...`).
+
+For **chunk** refining on local FineWeb without Slurm, see `scripts/data_gen/run_chunk_refining_fineweb_first_parquet.sh` and `data_gen/configs/apply_chunk_refining_fineweb_first_parquet.yaml`.
+
+## Three-stage local refiner pipeline (this repo)
+
+If you are iterating on the *chunk refiner* pipeline end-to-end, the codebase now has
+three top-level stage entrypoints (thin wrappers around the existing implementations):
+
+- **Stage 1 (`prox_finetuning_data_generation/`)**: run an existing chunk model to produce *chunk → program* pairs parquet.
+  - Main: `prox_finetuning_data_generation/main.py` (wraps `data_gen.tasks.apply_chunk_refining_pair_export`)
+  - Inspect helpers: `prox_finetuning_data_generation/print_input.py`, `prox_finetuning_data_generation/print_output.py`
+- **Stage 2 (`finetune_refiner/`)**: fine-tune Qwen on the stage-1 parquet.
+  - Main: `finetune_refiner/main.sh` (wraps `finetuning_refiner/run_finetune_refiner.sh`)
+  - Inspect helpers: `finetune_refiner/print_input.py`, `finetune_refiner/print_output.py`
+- **Stage 3 (`refiner_inference/`)**: run the fine-tuned model to generate programs, execute them, and write cleaned data parquet.
+  - Main: `refiner_inference/main.py` (wraps `data_gen.tasks.apply_chunk_refining`)
+  - Inspect helpers: `refiner_inference/print_input.py`, `refiner_inference/print_output.py`
 
 ## Training on ProX curated data
 

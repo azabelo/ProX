@@ -1,0 +1,11 @@
+# HF Trainer stack for finetuning/finetune.py (model_type: huggingface).
+# Pin accelerate>=0.26 — required by current transformers for Trainer device setup.
+# Install PyTorch with CUDA *before* this file (see install_llada_hf_env.sh).
+accelerate>=0.26.0
+transformers>=4.45.0
+datasets>=2.14.0
+pyyaml>=6.0
+wandb>=0.16.0
+pyarrow
+sentencepiece
+safetensors

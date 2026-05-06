@@ -1,0 +1,8 @@
+# Chunk refining on the first FineWeb sample shard (single parquet directory).
+# Paths are absolute; tune save_interval / stream_window for memory vs file count.
+# Parallel ranks write prox_<rank>/prox_*.parquet; scripts/data_gen/run_chunk_refining_fineweb_first_parquet.sh
+# merges them into one file (default: save_path/fineweb_sample_10BT_chunk_refined.parquet).
+data_path: /home/ubuntu/ProX/data/raw/HuggingFaceFW/fineweb/sample/10BT
+save_path: /home/ubuntu/ProX/data/raw/chunk_refining_fineweb_first_parquet
+save_name: prox
+save_interval: 100000

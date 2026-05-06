@@ -1,0 +1,23 @@
+# Declarative conda env (optional). Prefer: bash finetuning/install_llada_hf_env.sh
+# which installs CUDA-matched PyTorch before pip deps.
+#
+#   conda env create -f finetuning/environment_llada_hf.yml
+#   conda activate prox-llada-hf
+#   pip install torch==2.6.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu124
+#   pip install -r finetuning/requirements_llada_hf.txt
+
+name: prox-llada-hf
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - pip
+  - pip:
+      - accelerate>=0.26.0
+      - transformers>=4.45.0
+      - datasets>=2.14.0
+      - pyyaml>=6.0
+      - wandb>=0.16.0
+      - pyarrow
+      - sentencepiece
+      - safetensors

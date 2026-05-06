@@ -1,0 +1,5 @@
+# Doc refining on 8 row shards of the first FineWeb sample file (see my_Scripts/split_fineweb_first_parquet_8shards.py).
+data_path: /home/ubuntu/ProX/data/raw/HuggingFaceFW/fineweb/sample/10BT_doc_shards8
+save_path: /home/ubuntu/ProX/data/raw/doc_refining_fineweb_8gpu
+save_name: prox
+save_interval: 100000

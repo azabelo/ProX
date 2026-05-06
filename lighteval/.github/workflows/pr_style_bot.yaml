@@ -1,0 +1,16 @@
+name: PR Style Bot
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  style:
+    uses: huggingface/huggingface_hub/.github/workflows/style-bot-action.yml@f28006016356b5811bf92d45d6c39f9585f2ff4c
+    with:
+      python_quality_dependencies: "[quality]"
+    secrets:
+      bot_token: ${{ secrets.HF_STYLE_BOT_ACTION }}

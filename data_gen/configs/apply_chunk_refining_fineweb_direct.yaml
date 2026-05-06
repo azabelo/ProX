@@ -1,0 +1,5 @@
+# Chunk refining on raw FineWeb parquet (no doc-level pass). Paths are absolute.
+data_path: /home/ubuntu/ProX/data/raw/HuggingFaceFW/fineweb/sample/10BT
+save_path: /home/ubuntu/ProX/data/raw/chunk_refining_fineweb_10docs
+save_name: prox
+save_interval: 100000

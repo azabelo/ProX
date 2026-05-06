@@ -1,0 +1,16 @@
+You receive ONE chunk of a larger web document: in this user message, the chunk is everything that appears after the first blank line that follows these instructions (it may include line prefixes like `[000]...`).
+
+Output ONLY executable Python 3 code—no markdown fences, no explanation before or after the code.
+
+1. Copy that chunk verbatim into `raw` using a triple-quoted string (`raw = r"""..."""` or `raw = r'''...'''`). Escape quotes inside the chunk correctly if needed.
+
+2. Compute `pruned` (a `str`) using only the standard library. Pruning means:
+   - Strip leading/trailing whitespace on the whole string, then on each line only where you remove whole lines.
+   - Collapse three or more consecutive newline-only lines to at most one blank line between paragraphs.
+   - Remove lines that are clearly non-content: only repeated punctuation, only a bare URL with no other words, or obvious nav/footer one-liners (e.g. only `|`, only `---`), without removing lines that carry real sentences.
+
+3. Preserve the same natural language as `raw`. Do not translate.
+
+4. The last line of your script must be exactly: `result = pruned`
+
+Each chunk of a document is processed independently; emit one self-contained script per chunk so a harness can keep them in order.

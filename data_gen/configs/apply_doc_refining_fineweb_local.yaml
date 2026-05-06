@@ -1,0 +1,5 @@
+# Local 8-GPU FineWeb doc refining (absolute paths; no env substitution required).
+data_path: /home/ubuntu/ProX/data/raw/HuggingFaceFW/fineweb/sample/10BT
+save_path: /home/ubuntu/ProX/data/raw/doc_refining_fineweb_8gpu
+save_name: prox
+save_interval: 100000

@@ -1,0 +1,63 @@
+# Train a Qwen2.5-0.5B-shaped custom stack (GQA + RoPE + RMSNorm + SwiGLU) where *one* layer
+# uses sliding-window attention; all others use full causal attention.
+#
+# Run from repo root (``finetune.py`` puts the repo on ``sys.path``):
+#   python finetuning/finetune.py finetuning/example_finetune_custom_qwenlike_swa.yaml
+#
+# Notes:
+# - ``model_type: custom_local`` uses a minimal single-GPU loop in finetune.py (no VeOmni/FSDP, no periodic eval).
+# - Weights start random; ``init_model_path`` is only used for tokenizer/vocab size unless you add loading yourself.
+# - Tweak architecture under ``custom_arch`` (optional; defaults match ~0.5B shape).
+
+model_arch: custom_qwenlike_one_swa
+model_type: veomni_supported
+custom_model_factory: my_architectures.qwen_like_one_swa_layer:build_model
+
+init_model_path: Qwen/Qwen2.5-0.5B
+tokenizer_path: null
+
+resume_checkpoint_path: null
+
+inputs_dir_path: data/raw/DCLM-baseline-one-shard/global-shard_01_of_10/local-shard_0_of_10
+outputs_dir_path: openrouter_output_data/rewrite/1000docs
+
+dataset_type: dclm
+chunk_size: 1000
+is_code: false
+packing: false
+include_loss_from_input: false
+ensure_eos_on_target: true
+
+num_gpus: 1
+num_validation_documents: 50
+
+max_seq_len: 1024
+max_steps: 20
+num_train_epochs: 1
+global_batch_size: 8
+micro_batch_size: 1
+
+learning_rate: 3.0e-4
+weight_decay: 0.01
+warmup_ratio: 0.03
+lr_decay_style: cosine
+max_grad_norm: 1.0
+
+save_every_steps: 500
+eval_every_steps: 20
+eval_max_batches: 10
+
+checkpoint_output_dir: ./finetuning_outputs/custom_qwenlike_swa_run
+
+seed: 42
+wandb_project: prox-finetune
+wandb_run_name: custom-qwenlike-one-swa
+
+gradient_checkpointing: false
+
+# Which layer (0..num_hidden_layers-1) uses sliding-window attention; others are full causal.
+custom_arch:
+  swa_layer_index: 12
+  sliding_window: 128
+
+veomni: {}
