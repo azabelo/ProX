@@ -1,0 +1,143 @@
+data:
+  chat_template: default
+  data_type: text_per_token_binary
+  dataloader:
+    drop_last: true
+    num_workers: 2
+    pin_memory: true
+    prefetch_factor: 2
+    type: native
+    worker_num_threads: null
+  datasets_type: mapping
+  dyn_bsz_buffer_size: 200
+  eval_path: /home/ubuntu/ProX/None/prepared_val_pairs.parquet
+  max_seq_len: 2048
+  multisource_datasets_type: interleave
+  silent_exception: false
+  source_name: null
+  text_keys: text
+  train_path: /home/ubuntu/ProX/None/prepared_train_pairs.parquet
+  train_sample: 30
+  train_size: 10000000
+model:
+  basic_modules: []
+  config_path: /home/ubuntu/ProX/None/.finetune_inline_config
+  decoders: {}
+  encode_target: false
+  encoders: {}
+  foundation:
+    architecture: Qwen2EmbeddingForTokenClassification
+  input_encoder: encoder
+  lora_config: {}
+  model_path: Qwen/Qwen2.5-0.5B
+  ops_implementation:
+    attn_implementation: sdpa
+    causal_conv1d_implementation: fla
+    chunk_gated_delta_rule_implementation: fla
+    cross_entropy_loss_implementation: chunk_loss
+    load_balancing_loss_implementation: eager
+    moe_implementation: eager
+    rms_norm_gated_implementation: fla
+    rms_norm_implementation: eager
+    rotary_pos_emb_implementation: eager
+    swiglu_mlp_implementation: eager
+  output_encoder: decoder
+  safetensor_idx_path: null
+  tokenizer_path: Qwen/Qwen2.5-0.5B
+train:
+  accelerator:
+    cp_size: 1
+    dp_replicate_size: 1
+    dp_shard_size: 8
+    enable_async: false
+    ep_outside: false
+    ep_size: 1
+    extra_parallel_names:
+    - ep
+    extra_parallel_placement_innermost:
+    - false
+    extra_parallel_sizes:
+    - 1
+    fsdp_config:
+      forward_prefetch: true
+      fsdp_mode: ddp
+      full_shard: false
+      max_load_broadcast_size: 20.0
+      mixed_precision:
+        buffer_dtype: null
+        cast_forward_inputs: true
+        enable: false
+        output_dtype: null
+        param_dtype: bfloat16
+        reduce_dtype: float32
+      offload: false
+      reshard_after_backward: true
+      reshard_after_forward: true
+    offload_config:
+      activation_gpu_limit: 0.0
+      enable_activation: false
+    pp_size: 1
+    tp_size: 1
+    ulysses_size: 1
+  broadcast_model_weights_from_rank0: false
+  bsz_warmup_init_mbtoken: 200
+  bsz_warmup_ratio: 0
+  checkpoint:
+    hf_save_epochs: 0
+    hf_save_steps: 0
+    load_path: /home/ubuntu/ProX/finetuning_outputs/example_embedding_run_delete_only/checkpoints/global_step_30
+    manager: dcp
+    output_dir: None
+    save_async: false
+    save_epochs: 1
+    save_hf_weights: false
+    save_steps: 500
+  dyn_bsz: false
+  dyn_bsz_runtime: main
+  empty_cache_steps: 500
+  enable_batch_invariant_mode: false
+  enable_compile: false
+  enable_full_determinism: false
+  eval_epochs: 0
+  eval_steps: 300
+  gc_steps: 500
+  global_batch_size: 8
+  gradient_checkpointing:
+    debug: false
+    enable: true
+    enable_reentrant: false
+  init_device: cuda
+  max_steps: 300
+  micro_batch_size: 1
+  moe_load_balance_monitor_interval: 0
+  num_train_epochs: 10
+  optimizer:
+    lr: 5.0e-05
+    lr_decay_ratio: 1.0
+    lr_decay_style: cosine
+    lr_min: 1.0e-07
+    lr_start: 0.0
+    lr_warmup_ratio: 0.03
+    max_grad_norm: 1.0
+    no_decay_modules: []
+    no_decay_params: []
+    type: adamw
+    weight_decay: 0.01
+  pad_to_length: false
+  profile:
+    enable: false
+    end_step: 2
+    profile_memory: true
+    rank0_only: true
+    record_shapes: true
+    start_step: 1
+    trace_dir: ./trace
+    with_modules: false
+    with_stack: true
+  seed: 42
+  train_architecture: full
+  wandb:
+    enable: true
+    id: null
+    name: None
+    project: prox-finetune-embedding

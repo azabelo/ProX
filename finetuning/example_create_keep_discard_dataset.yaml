@@ -1,0 +1,25 @@
+# Example for finetuning/create_keep_discard_dataset.py
+#
+# Run (repo root):
+#   python finetuning/create_keep_discard_dataset.py finetuning/example_create_keep_discard_dataset.yaml
+
+# Load paths from your OpenRouter run YAML, then override only what differs:
+merge_from_openrouter_yaml: ../openrouter_data_generation/example_openrouter_rewrite.yaml
+
+# Required: masks are written beside one another per shard: {stem}_keep_discard.parquet
+output_masks_dir: ./finetuning_outputs/example_keep_discard_masks
+
+# Optional overrides (unset here = inherited from merged YAML):
+
+# Explicit raw corpus for the left side of the diff (same shard basenames / row order as data_parquet_dir).
+# Omit to use pipeline input shards as the reference text.
+# diff_raw_parquet_dir: ...
+
+# Maximum input shards (-1 = all). Inherited from merged file unless overridden.
+# max_parquets: -1
+
+# Match OpenRouter ``output_is_code`` when merging code-task parquets:
+# is_code: false
+
+# mask_column_name: char_keep_mask
+# strip_chunk_program_separators: true

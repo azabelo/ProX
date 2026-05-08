@@ -15,12 +15,14 @@ tokenizer_path: null  # defaults to init_model_path
 # VeOmni DCP resume: directory must contain ``.metadata`` (e.g. .../checkpoints/global_step_130).
 # Relative paths resolve from this YAML file's directory. With save_every_steps: 500 and max_steps: 130,
 # periodic saves never fire; the train-end checkpoint is ``global_step_130``, not global_step_100.
-# resume_checkpoint_path: null
-resume_checkpoint_path: /home/ubuntu/ProX/finetuning_outputs/example_run/checkpoints/global_step_30
+
+resume_checkpoint_path: null
+# resume_checkpoint_path: /home/ubuntu/ProX/finetuning_outputs/example_run/checkpoints/global_step_30
 
 # Match openrouter_data_generation run (e.g. openrouter_output_data/rewrite/1000docs/example_openrouter_rewrite.yaml)
 inputs_dir_path: data/raw/DCLM-baseline-one-shard/global-shard_01_of_10/local-shard_0_of_10
-outputs_dir_path: openrouter_output_data/rewrite/1000docs
+# outputs_dir_path: openrouter_output_data/rewrite/1000docs
+outputs_dir_path: openrouter_output_data/rewrite/web_book_clean
 
 # Same adapters as openrouter_data_generation: fineweb | dclm | redpajama | redpajama-v2 | passthrough
 dataset_type: dclm
@@ -36,7 +38,7 @@ num_gpus: 8
 num_validation_documents: 50
 
 max_seq_len: 2048
-max_steps: 201
+max_steps: 161
 num_train_epochs: 1  # VeOmni uses max_steps when set (caps steps per epoch)
 global_batch_size: 8
 micro_batch_size: 1
@@ -48,7 +50,7 @@ lr_decay_style: cosine
 max_grad_norm: 1.0
 
 save_every_steps: 500
-eval_every_steps: 201 # > 0: parquet val CE / sanity on rank 0; multi-GPU uses barriers so ranks stay in sync
+eval_every_steps: 161 # > 0: parquet val CE / sanity on rank 0; multi-GPU uses barriers so ranks stay in sync
 eval_max_batches: 20
 
 checkpoint_output_dir: ./finetuning_outputs/example_run

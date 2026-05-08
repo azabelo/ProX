@@ -1,0 +1,23 @@
+# Example config for ``my_evals/eval_compare.py``.
+#
+# Each entry under ``models`` is one bar-group on the chart. ``path`` should
+# point at a directory that contains an ``lm_eval_results/`` subdirectory
+# produced by ``my_evals/eval_lm_eval.sh`` (i.e. the same directory you pass
+# to that script, e.g. ``.../global_step_<N>/hf_ckpt``). If you instead point
+# at the parent ``global_step_<N>/`` the script will also look one level
+# deeper at ``hf_ckpt/lm_eval_results/``.
+#
+# Each entry under ``tasks`` is the name of a task or group as it appears in
+# ``results_*.json`` (e.g. ``mmlu``, ``mmlu_stem``, ``mmlu_abstract_algebra``,
+# ``wikitext``). The metric is auto-picked: ``acc`` for MMLU-style tasks,
+# ``word_perplexity`` for wikitext-style tasks, falling back to the first
+# numeric metric in ``higher_is_better``. To force a specific metric, write
+# the task as ``<task_name>:<metric>`` (e.g. ``wikitext:bits_per_byte``).
+
+models:
+  step_4:  /home/ubuntu/ProX/continued_pretraining_outputs/dclm_llama3p2_1b_fast/checkpoints/global_step_4/hf_ckpt
+  step_6: /home/ubuntu/ProX/continued_pretraining_outputs/dclm_llama3p2_1b_fast/checkpoints/global_step_6/hf_ckpt
+
+tasks:
+  - wikitext
+  - mmlu

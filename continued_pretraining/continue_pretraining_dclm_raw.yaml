@@ -1,0 +1,113 @@
+# Example config for continued_pretraining/continue_pretraining.py
+#
+# Tuned for throughput on NVIDIA H100s:
+#   - install/verify the ``pretrain`` env with ``bash continued_pretraining/setup_pretrain_env.sh``.
+#   - ``attn_implementation: auto`` should resolve to ``flash_attention_2`` in that env.
+#   - ``global_batch_size: 256``, ``micro_batch_size: 32`` is a safer starting point
+#     for Llama-3.2-1B on 8×80GB H100. If you have VRAM headroom, try micro_batch_size 40
+#     and global_batch_size 320.
+#
+# If ``flash_attn`` is unavailable, the script falls back to SDPA and keeps this rectangular
+# batching profile stable; run the setup script above for the faster FlashAttention path.
+#
+# Run:
+#   PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python continued_pretraining/continue_pretraining.py \
+#       continued_pretraining/example_continue_pretraining.yaml
+#
+# Or explicitly:
+#   PYTHONNOUSERSITE=1 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
+#   torchrun --standalone --nproc_per_node=8 continued_pretraining/continue_pretraining.py \
+#       continued_pretraining/example_continue_pretraining.yaml
+
+# ---------------------------------------------------------------------------
+# Model
+# ---------------------------------------------------------------------------
+init_model_path: unsloth/Llama-3.2-1B
+tokenizer_path: null
+model_arch: auto
+
+resume_checkpoint_path: null
+# resume_checkpoint_path: ./continued_pretraining_outputs/dclm_llama3p2_1b_fast/checkpoints/global_step_500
+
+# auto → flash_attention_2 if ``flash_attn`` imports, else sdpa.
+# Use ``sdpa`` to force rectangular-batch SDPA (matches ``packing: false`` profile below).
+attn_implementation: auto
+
+# ---------------------------------------------------------------------------
+# Data
+# ---------------------------------------------------------------------------
+inputs_dir_path: data/raw/DCLM-baseline-one-shard/global-shard_01_of_10/local-shard_0_of_10
+dataset_type: dclm
+num_validation_documents: 10000
+max_input_documents: null
+# Keep prepared train/val parquets outside per-run checkpoint dirs so repeated
+# experiments can reuse them instead of duplicating large data files.
+prepared_data_dir: none #./continued_pretraining_outputs/prepared_data/dclm_llama3p2_1b_1b_tokens 
+train_token_oversample: 1.5
+chars_per_token: 4.0
+
+# ---------------------------------------------------------------------------
+# Training schedule — single-H100 high throughput
+# (256 × 2048 = 524,288 upper-bound tokens per optimizer step; actual packed tokens vary by docs)
+# ---------------------------------------------------------------------------
+max_training_tokens: 1_000_000_000
+max_steps: null
+num_train_epochs: 1
+
+max_seq_len: 2048
+global_batch_size: 128
+micro_batch_size: 16
+
+# Rectangular batches avoid dyn-batch worker overhead; flash_attention_2 is still used for attention.
+packing: true
+
+# ---------------------------------------------------------------------------
+# Optimizer (unchanged semantics; tweak for your continuation schedule)
+# ---------------------------------------------------------------------------
+learning_rate: 1.0e-4
+weight_decay: 0.1
+warmup_ratio: 0.01
+lr_decay_style: cosine
+max_grad_norm: 1.0
+
+# ---------------------------------------------------------------------------
+# Hardware / parallelism
+# ---------------------------------------------------------------------------
+num_gpus: 2
+fsdp_mode: ddp
+
+gradient_checkpointing: false
+
+# DataLoader prefetch (bump workers further if CPU-bound)
+dataloader_num_workers: 16
+dataloader_prefetch_factor: 4
+
+# ---------------------------------------------------------------------------
+# Checkpointing / eval / wandb
+# ---------------------------------------------------------------------------
+# VeOmni saves a resumable DCP under global_step_<N>/ at every save_every_steps,
+# but HuggingFace weights are exported only once at train end (see
+# continue_pretraining.py: hf_save_steps is forced to 0 so mid-run HF saves are
+# skipped). The HF export itself is also fast-pathed for DDP via
+# ``_install_fast_hf_save`` (rank-0 dumps the live model with safetensors
+# directly instead of round-tripping through DCP files on disk), so train-end
+# typically takes <15s for a 1B model. The result lands in
+# global_step_<N>/hf_ckpt/ for my_evals/eval_lm_eval.sh to pick up.
+save_every_steps: 1000
+eval_every_steps: 100
+eval_max_batches: 32
+
+checkpoint_output_dir: ./continued_pretraining_outputs/dclm_llama3p2_1b_fast
+
+seed: 42
+wandb_project: prox-continue-pretraining
+wandb_run_name: null
+
+veomni_overrides:
+  train:
+    # VeOmni defaults to 500. Lower values help long runs avoid CUDA allocator
+    # fragmentation OOMs after many successful steps.
+    empty_cache_steps: 25
+    gc_steps: 25
+    # Optional when you switch to packing: true + flash-attn:
+    # dyn_bsz_runtime: worker

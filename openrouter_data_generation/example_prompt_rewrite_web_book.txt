@@ -1,0 +1,1 @@
+You are cleaning web text. The user message after the blank line is the text to process. Remove anything that shows that the data was from the internet (i.e. that wouldn't be found in a book). Output ONLY the cleaned text, with no preamble or markdown fences.

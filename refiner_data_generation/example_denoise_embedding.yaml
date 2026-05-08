@@ -1,0 +1,80 @@
+# Example: per-token keep/discard binary classifier (Qwen2 backbone with the LAST decoder block
+# dropped + a 1-D ``score`` head; see finetuning/example_finetune_embedding.yaml).
+#
+# Pipeline summary (embedding mode is_embedding_model: true):
+#   - The script bypasses vLLM and loads ``Qwen2EmbeddingForTokenClassification`` with
+#     HuggingFace transformers + PyTorch.
+#   - Each character chunk is tokenized with ``add_special_tokens=False`` and
+#     ``return_offsets_mapping=True`` (mirrors the ``text_per_token_binary`` data transform used
+#     at training time), so token labels stay 1:1 with input_ids.
+#   - The model returns a per-token score-logit. Tokens with logit > ``keep_logit_threshold``
+#     are kept; the chunk is reconstructed by concatenating the source character spans of every
+#     kept token. Tokens whose offset span is empty (special tokens) are skipped.
+#   - Output rows have the exact same schema as the autoregressive denoise run; the ``text`` /
+#     ``programs_delimited`` field carries the kept-only text.
+#
+# Run from repo root (single GPU):
+#   python refiner_data_generation/denoise_dataset.py refiner_data_generation/example_denoise_embedding.yaml
+#
+# Run with 8 GPUs (each a full-model replica, shards round-robined):
+#   set num_gpus: 1 and data_parallel_replicas: 8 below.
+
+# DCLM baseline one shard — same source as the autoregressive denoise example:
+input_parquet_dir: data/raw/DCLM-baseline-one-shard/global-shard_01_of_10/local-shard_0_of_10
+dataset_type: dclm
+
+output_data_dir: refiner_output_data/example_denoise_embedding_run_delete_only
+overwrite: true
+continue: false
+
+chunk_size: 1000
+is_code: false
+
+# === Embedding mode flags (this YAML's reason for existing) =================================
+is_embedding_model: true
+# Keep the token if its score-logit is greater than this (sigmoid > 0.5 by default).
+# Increase to be more aggressive about discarding noisy spans (closer to ``LABEL_1`` only).
+keep_logit_threshold: 0.0
+# ==========================================================================================
+
+# Informational. Autoregressive denoise embeds this in the fingerprint; same here.
+model_arch: Qwen2EmbeddingForTokenClassification
+
+# VeOmni training output (DCP). After merge, weights live under ``.../global_step_<N>/hf_ckpt/``.
+# Default points at the example_embedding_run_delete_only run from
+# finetuning/example_finetune_embedding.yaml; update to the run you trained.
+model_checkpoint_path: /home/ubuntu/ProX/finetuning_outputs/example_embedding_run_delete_only/checkpoints/global_step_120
+
+# DCP merge does not embed tokenizer files — pass the same tokenizer as the finetune YAML.
+# This MUST be a fast tokenizer (offset_mapping required); Qwen/Qwen2.5-0.5B is fast.
+tokenizer_path: Qwen/Qwen2.5-0.5B
+
+# === Parallelism ===========================================================================
+# Embedding mode does NOT shard the model with TP. Keep num_gpus: 1 and use
+# data_parallel_replicas for throughput (one GPU per full-model worker).
+num_gpus: 1
+data_parallel_replicas: 8
+# Optional: pin physical GPU indices (length must equal data_parallel_replicas)
+# data_parallel_gpu_ids: [0, 1, 2, 3, 4, 5, 6, 7]
+
+# === Caps (any cap hit -> stop) ============================================================
+max_docs: -1
+max_chars: -1
+max_chunks: -1
+max_tokens: -1
+max_parquets: 1
+
+# === Forward batch / sequence shapes =======================================================
+# Number of chunks per ``model(...)`` forward pass. Tune up for higher throughput on bigger GPUs.
+chunk_batch_size: 64
+# Tokenizer truncation length. With ``chunk_size: 1000`` chars on Qwen2 BPE this is well below
+# 2048 tokens; raise if you grow chunk_size.
+max_model_len: 2048
+# Embedding mode does not generate; max_new_tokens is ignored. Keep it for parity / fingerprint.
+max_new_tokens: 0
+trust_remote_code: true
+
+metrics_interval_sec: 15.0
+
+# vllm extras are unused in embedding mode (no vLLM engine spun up). Left empty for parity.
+vllm: {}

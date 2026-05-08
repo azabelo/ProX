@@ -174,6 +174,31 @@ def _split_output_parts(merged: str) -> list[str]:
     return [merged]
 
 
+def _strip_chunk_separators(text: str) -> str:
+    if not text:
+        return text
+    return text.replace(PROGRAM_CHUNK_SEPARATOR, "")
+
+
+def character_keep_mask(reference: str, revised: str) -> str:
+    """``'0'``/``'1'`` per reference codepoint; ``'1'`` iff inside a SequenceMatcher ``equal`` opcode.
+
+    Same rule as ``openrouter_data_generation/view_nth_input_output_diff.py`` (``_simple_diff_merge_html``):
+    insertions on the revised side do not change mask length; only ``equal`` reference spans are kept.
+    """
+    from difflib import SequenceMatcher
+
+    n = len(reference)
+    if n == 0:
+        return ""
+    sm = SequenceMatcher(None, reference, revised, autojunk=False)
+    parts = ["0"] * n
+    for tag, i1, i2, _j1, _j2 in sm.get_opcodes():
+        if tag == "equal" and i2 > i1:
+            parts[i1:i2] = ["1"] * (i2 - i1)
+    return "".join(parts)
+
+
 def _read_row_by_index(shard: Path, row_index: int) -> dict[str, Any]:
     idx = 0
     for row in iter_shard_rows(shard):
@@ -245,6 +270,16 @@ class FinetuneConfig:
     # so the last supervised token in chat/text_target loss can be EOS (helps learned stopping in generate()).
     ensure_eos_on_target: bool = True
     diffusion_lm: bool = False
+    # When True, train a per-token binary keep/discard classifier (e.g. ``qwen2_embedding``) instead of a causal LM.
+    #
+    # The training pair becomes (raw input chunk, per-character ``'0'``/``'1'`` keep mask of equal length).
+    # The mask is computed on the fly via ``difflib.SequenceMatcher.get_opcodes()`` (same rule as
+    # ``openrouter_data_generation/view_nth_input_output_diff.py`` and the standalone
+    # ``finetuning/create_keep_discard_dataset.py`` helper) — only ``equal`` reference spans are kept.
+    # During tokenization the per-character mask is folded into a per-token mask via logical AND
+    # (any deleted character in a token's offset span -> token label = 0; otherwise 1). Tokens with
+    # empty character spans (e.g. special tokens) are labeled ``IGNORE_INDEX`` and excluded from loss.
+    is_embedding_model: bool = False
     # HuggingFace-style model config dict (optional). When set, overrides ``veomni_overrides.model.config_path`` and
     # is written to ``checkpoint_output_dir/.finetune_inline_config/config.json`` at run time.
     model_config: dict[str, Any] | None = None
@@ -292,6 +327,7 @@ class FinetuneConfig:
             veomni_overrides=dict(g("veomni_overrides", g("veomni", {})) or {}),
             ensure_eos_on_target=_bool(g("ensure_eos_on_target", True)),
             diffusion_lm=_bool(g("diffusion_lm", False)),
+            is_embedding_model=_bool(g("is_embedding_model", False)),
             model_config=_mc_raw if _mc_raw else None,
         )
 
@@ -354,9 +390,31 @@ def _finalize_resume_checkpoint_path(cfg: FinetuneConfig) -> None:
 def _materialize_inline_model_config(cfg: FinetuneConfig) -> str | None:
     """Write ``cfg.model_config`` to disk for VeOmni ``AutoConfig.from_pretrained(dir)``.
 
-    Returns the directory path containing ``config.json``, or ``None`` if no inline config.
+    For ``is_embedding_model: true`` without an explicit ``model_config``, derive one from the
+    pretrained ``init_model_path`` HF config (Qwen2.5-0.5B etc.): copy every hyperparameter, override
+    ``model_type`` to ``qwen2_embedding``, set ``architectures`` to
+    ``['Qwen2EmbeddingForTokenClassification']``, force ``tie_word_embeddings: false`` (no
+    ``lm_head``), and append ``drop_last_n_layers: 1`` so the inner Qwen2 backbone has one fewer
+    decoder block. Pretrained Qwen2 weights then load by name into the truncated backbone (last
+    layer + ``lm_head`` are skipped as unexpected keys; the ``score`` head is initialized fresh by
+    ``post_process_after_weight_loading``).
     """
     mc = getattr(cfg, "model_config", None)
+    if not mc and getattr(cfg, "is_embedding_model", False) and cfg.init_model_path:
+        try:
+            from transformers import AutoConfig as _AutoConfig
+
+            base = _AutoConfig.from_pretrained(cfg.init_model_path, trust_remote_code=True)
+            mc = base.to_dict()
+        except Exception as e:
+            raise SystemExit(
+                f"[finetune] is_embedding_model=true but could not autoload base config from "
+                f"init_model_path={cfg.init_model_path!r}: {e}"
+            )
+        mc["model_type"] = "qwen2_embedding"
+        mc["architectures"] = ["Qwen2EmbeddingForTokenClassification"]
+        mc["tie_word_embeddings"] = False
+        mc.setdefault("drop_last_n_layers", 1)
     if not mc:
         return None
     out_dir = Path(cfg.checkpoint_output_dir).expanduser().resolve() / ".finetune_inline_config"
@@ -510,6 +568,190 @@ def build_pair_rows(cfg: FinetuneConfig) -> tuple[list[dict[str, str]], list[dic
     return train_rows, val_rows
 
 
+def build_embedding_pair_rows(cfg: FinetuneConfig) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """
+    Build train/val rows for the per-token keep/discard binary task.
+
+    Each row's ``text`` is a raw input chunk (same chunking rule as ``build_pair_rows``); ``target``
+    is a string of ``'0'``/``'1'`` of equal length to ``text``, where ``'1'`` marks characters that
+    appear in a SequenceMatcher ``equal`` span vs the OpenRouter rewritten chunk (everything else =
+    deleted/replaced -> ``'0'``). No giant char-mask parquet is materialized; the masks are computed
+    here at row-build time from raw input + OpenRouter output (same pipeline as
+    ``finetuning/create_keep_discard_dataset.py``, but kept inline so output parquet of ``0``/``1``
+    is not needed).
+    """
+    inputs_dir = Path(cfg.inputs_dir_path).expanduser().resolve()
+    outputs_dir = Path(cfg.outputs_dir_path).expanduser().resolve()
+    if not inputs_dir.is_dir():
+        raise SystemExit(f"inputs_dir_path is not a directory: {inputs_dir}")
+    if not outputs_dir.is_dir():
+        raise SystemExit(f"outputs_dir_path is not a directory: {outputs_dir}")
+
+    _warn_output_chunk_size(outputs_dir, cfg.chunk_size)
+
+    row_text_fn = get_row_text_fn(cfg.dataset_type)
+    doc_keys: list[tuple[str, int]] = []
+    seen: set[tuple[str, int]] = set()
+    import pyarrow.parquet as pq
+
+    for pq_out in _discover_output_parquets(outputs_dir):
+        for batch in pq.ParquetFile(pq_out).iter_batches(columns=["source_parquet", "source_row_index"]):
+            sp = batch.column(0).to_pylist()
+            sr = batch.column(1).to_pylist()
+            for a, b in zip(sp, sr):
+                key = (str(a), int(b))
+                if key not in seen:
+                    seen.add(key)
+                    doc_keys.append(key)
+
+    rng = random.Random(cfg.seed)
+    rng.shuffle(doc_keys)
+    n_val = min(cfg.num_validation_documents, len(doc_keys))
+    val_set = set(doc_keys[:n_val])
+
+    train_rows: list[dict[str, str]] = []
+    val_rows: list[dict[str, str]] = []
+    dropped_mismatch = 0
+
+    for pq_out in _discover_output_parquets(outputs_dir):
+        for row in pq.ParquetFile(pq_out).iter_batches():
+            col_names = row.schema.names
+            for i in range(row.num_rows):
+                rec = {name: row.column(j)[i].as_py() for j, name in enumerate(col_names)}
+                sp = str(rec.get("source_parquet") or "")
+                sr = rec.get("source_row_index")
+                if sr is None:
+                    continue
+                key = (sp, int(sr))
+                merged = _output_merged_text(rec, cfg.is_code)
+                merged = _strip_chunk_separators(merged)
+                out_parts = _split_output_parts(merged) if not merged or PROGRAM_CHUNK_SEPARATOR in merged else [merged]
+                try:
+                    shard = _resolve_input_shard(inputs_dir, sp)
+                    src_row = _read_row_by_index(shard, int(sr))
+                except Exception as e:
+                    print(f"[finetune][warn] skip row {key}: {e}", flush=True)
+                    continue
+                doc_text = row_text_fn(src_row)
+                in_chunks = chunk_text(doc_text, cfg.chunk_size)
+                n_in, n_out = len(in_chunks), len(out_parts)
+                if n_in != n_out:
+                    dropped_mismatch += 1
+                    continue
+                if n_in == 0:
+                    continue
+                bucket = val_rows if key in val_set else train_rows
+                for ci in range(n_in):
+                    src_chunk = in_chunks[ci]
+                    rev_chunk = out_parts[ci]
+                    mask = character_keep_mask(src_chunk, rev_chunk)
+                    if len(mask) != len(src_chunk):
+                        continue
+                    bucket.append({"text": src_chunk, "target": mask})
+
+    if dropped_mismatch:
+        print(
+            f"[finetune][embedding] dropped {dropped_mismatch} document(s) with mismatched "
+            f"input/output chunk counts.",
+            flush=True,
+        )
+    if not train_rows:
+        raise SystemExit("No keep/discard training pairs built; check paths and chunk_size.")
+    print(
+        f"[finetune][embedding] built {len(train_rows)} train pairs, {len(val_rows)} val pairs.",
+        flush=True,
+    )
+    return train_rows, val_rows
+
+
+def _register_text_per_token_binary() -> None:
+    """Register VeOmni transform for keep/discard token-level binary classification.
+
+    Tokenizes ``text`` (no special tokens / no chat template — special tokens have no character span
+    and would always be excluded anyway). For each resulting token, builds a per-token label by AND-ing
+    every character of ``target`` (the per-character ``'0'``/``'1'`` mask) inside the token's offset
+    range: any deleted character in the token -> label ``0``, otherwise ``1``. Tokens with empty offset
+    spans get ``IGNORE_INDEX``.
+    """
+    from veomni.data.data_transform import DATA_TRANSFORM_REGISTRY
+    from veomni.utils.constants import IGNORE_INDEX
+
+    # ``Registry.__contains__`` raises on missing keys (delegates to ``__getitem__``); use the safe iter form.
+    if "text_per_token_binary" in list(DATA_TRANSFORM_REGISTRY):
+        return
+
+    @DATA_TRANSFORM_REGISTRY.register("text_per_token_binary")
+    def process_text_per_token_binary(
+        example: dict[str, Any],
+        tokenizer: Any,
+        max_seq_len: int,
+        chat_template: Any = None,
+        text_keys: Any = "text",
+        **kwargs: Any,
+    ) -> list[dict[str, Any]]:
+        del chat_template, text_keys, kwargs
+        import torch
+
+        text = str(example.get("text", "") or "")
+        target = str(example.get("target", "") or "")
+        if len(target) != len(text):
+            # length mismatch should never happen; fall back to "all ignore" rather than corrupt training.
+            target = "0" * len(text)
+
+        if not text:
+            fallback_id = (
+                tokenizer.eos_token_id
+                if tokenizer.eos_token_id is not None
+                else (tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0)
+            )
+            return [
+                {
+                    "input_ids": torch.tensor([int(fallback_id)], dtype=torch.long),
+                    "attention_mask": torch.tensor([1], dtype=torch.long),
+                    "labels": torch.tensor([IGNORE_INDEX], dtype=torch.long),
+                }
+            ]
+
+        # Fast tokenizer required for offsets. Hugging Face Qwen2 tokenizer has it.
+        enc = tokenizer(
+            text,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+            truncation=True,
+            max_length=max_seq_len,
+        )
+        ids = enc["input_ids"]
+        offsets = enc["offset_mapping"]
+        n = len(text)
+        labels: list[int] = []
+        for s, e in offsets:
+            if e <= s or s >= n:
+                labels.append(IGNORE_INDEX)
+                continue
+            e_clamped = min(int(e), n)
+            chunk = target[int(s) : e_clamped]
+            if not chunk:
+                labels.append(IGNORE_INDEX)
+                continue
+            labels.append(0 if "0" in chunk else 1)
+
+        if not ids:
+            return [
+                {
+                    "input_ids": torch.tensor([0], dtype=torch.long),
+                    "attention_mask": torch.tensor([1], dtype=torch.long),
+                    "labels": torch.tensor([IGNORE_INDEX], dtype=torch.long),
+                }
+            ]
+        return [
+            {
+                "input_ids": torch.tensor(ids, dtype=torch.long),
+                "attention_mask": torch.tensor([1] * len(ids), dtype=torch.long),
+                "labels": torch.tensor(labels, dtype=torch.long),
+            }
+        ]
+
+
 def _deep_update(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
     for k, v in b.items():
         if isinstance(v, dict) and isinstance(a.get(k), dict):
@@ -526,7 +768,7 @@ def _register_full_loss_text_target() -> None:
 
     from veomni.data.data_transform import DATA_TRANSFORM_REGISTRY, _truncate_ids_labels
 
-    if "text_target_all" in DATA_TRANSFORM_REGISTRY:
+    if "text_target_all" in list(DATA_TRANSFORM_REGISTRY):
         return
 
     @DATA_TRANSFORM_REGISTRY.register("text_target_all")
@@ -610,7 +852,12 @@ def _veomni_dict(cfg: FinetuneConfig, train_parquet: str, eval_parquet: str | No
         foundation["architecture"] = cfg.model_arch
 
     dyn_bsz = bool(cfg.packing)
-    data_type = "text_target_all" if cfg.include_loss_from_input else "text_target"
+    if cfg.is_embedding_model:
+        data_type = "text_per_token_binary"
+    elif cfg.include_loss_from_input:
+        data_type = "text_target_all"
+    else:
+        data_type = "text_target"
 
     base: dict[str, Any] = {
         "model": {
@@ -684,6 +931,13 @@ def _veomni_dict(cfg: FinetuneConfig, train_parquet: str, eval_parquet: str | No
     # PyTorch 2.x (SIGSEGV / None grad_fn / mixed_precision_hooks NoneType). Llada uses FP32 embedding
     # tables and BF16 blocks without DDP's MP wrapper (see ``modeling_llada_mini``).
     if cfg.diffusion_lm:
+        merged.setdefault("train", {}).setdefault("accelerator", {}).setdefault("fsdp_config", {}).setdefault(
+            "mixed_precision", {}
+        )["enable"] = False
+    # Per-token binary classifier: same DDP+MP embedding fragility as ``llada_mini`` (FP32 embed table /
+    # BF16 blocks) — and there is no ``lm_head`` to back-tie. Keep mixed precision off so the autograd
+    # hooks installed by DDP's MixedPrecision wrapper don't NPE on the embedding parameter.
+    if cfg.is_embedding_model:
         merged.setdefault("train", {}).setdefault("accelerator", {}).setdefault("fsdp_config", {}).setdefault(
             "mixed_precision", {}
         )["enable"] = False
@@ -1231,9 +1485,146 @@ def _build_parquet_eval_callback(
     return ParquetEvalCallback(trainer, val_parquet, max_batches, diffusion_lm)
 
 
+def _build_embedding_eval_callback(trainer: Any, val_parquet: str | None, max_batches: int) -> Any:
+    """Per-token binary keep/discard eval: reports BCE-loss + accuracy on the val parquet (rank 0 only)."""
+    from veomni.trainer.callbacks.evaluate_callback import EvaluateCallback
+
+    class EmbeddingEvalCallback(EvaluateCallback):
+        def __init__(self, t: Any, vp: str | None, mb: int) -> None:
+            super().__init__(t)
+            self.val_parquet = vp
+            self.max_batches = mb
+            self._built = False
+            self._loader = None
+
+        def on_train_end(self, state: Any) -> None:
+            args = self.trainer.args
+            es = getattr(args.train, "eval_steps", None)
+            if not es or not self.val_parquet or not Path(self.val_parquet).is_file():
+                return
+            if state.global_step <= 0 or state.global_step % es == 0:
+                return
+            self._evaluate(state)
+
+        def _evaluate(self, state: Any) -> None:
+            if not self.val_parquet or not Path(self.val_parquet).is_file():
+                return
+            import torch
+            import torch.distributed as dist
+            from torch.utils.data import DataLoader
+
+            from veomni.data.data_transform import build_data_transform
+            from veomni.data.dataset import build_mapping_dataset
+            from veomni.utils import helper
+            from veomni.utils.constants import IGNORE_INDEX
+
+            args = self.trainer.args
+            rank = dist.get_rank() if dist.is_initialized() else 0
+
+            if dist.is_initialized():
+                dist.barrier()
+
+            if rank != 0:
+                if dist.is_initialized():
+                    dist.barrier()
+                self.trainer.model.train()
+                return
+
+            if not self._built:
+                transform = build_data_transform(
+                    args.data.data_type,
+                    tokenizer=self.trainer.tokenizer,
+                    chat_template=self.trainer.chat_template,
+                    max_seq_len=args.data.max_seq_len,
+                    text_keys=args.data.text_keys,
+                )
+                ds = build_mapping_dataset(
+                    train_path=self.val_parquet,
+                    transform=transform,
+                    namespace="train",
+                    distributed_sync=False,
+                )
+
+                def collate(batch: list) -> Any:
+                    flat = []
+                    for item in batch:
+                        flat.append(item[0] if isinstance(item, list) else item)
+                    return self.trainer.collate_fn(flat)
+
+                self._loader = DataLoader(
+                    ds, batch_size=1, shuffle=False, num_workers=0, collate_fn=collate
+                )
+                self._built = True
+
+            self.trainer.model.eval()
+            total_loss = 0.0
+            n_batches = 0
+            n_correct = 0
+            n_total = 0
+            with _inference_inner(self.trainer.model) as inner:
+                with torch.no_grad():
+                    for i, micro in enumerate(self._loader):
+                        if i >= self.max_batches:
+                            break
+                        mb = micro[0] if isinstance(micro, list) else micro
+                        mb = {
+                            k: v.to(self.trainer.device, non_blocking=True) if torch.is_tensor(v) else v
+                            for k, v in mb.items()
+                        }
+                        out = inner(**mb, use_cache=False)
+                        if out.loss is not None:
+                            total_loss += float(out.loss.item())
+                            n_batches += 1
+                        if "labels" in mb and out.logits is not None:
+                            labels = mb["labels"]
+                            mask = labels.ne(IGNORE_INDEX)
+                            if mask.any():
+                                preds = (out.logits[mask] > 0).long()
+                                n_correct += int((preds == labels[mask].long()).sum().item())
+                                n_total += int(mask.sum().item())
+            if n_batches > 0:
+                mean_loss = total_loss / n_batches
+                acc = (n_correct / n_total) if n_total > 0 else 0.0
+                helper.logger.info_rank0(
+                    f"[eval][embedding] step={state.global_step} bce={mean_loss:.4f} acc={acc:.4f} "
+                    f"(batches={n_batches}, tokens={n_total})"
+                )
+                try:
+                    import wandb
+
+                    if args.train.wandb.enable:
+                        wandb.log(
+                            {"eval/loss": mean_loss, "eval/token_accuracy": acc},
+                            step=int(state.global_step),
+                        )
+                except Exception:
+                    pass
+
+            if dist.is_initialized():
+                dist.barrier()
+            self.trainer.model.train()
+
+    return EmbeddingEvalCallback(trainer, val_parquet, max_batches)
+
+
 def _maybe_patch_diffusion_lm_collator(trainer: Any, diffusion_lm: bool) -> None:
     """Masked diffusion LMs need labels aligned with ``input_ids`` (no causal label shift in the collator)."""
     if not diffusion_lm:
+        return
+    from veomni.data.data_collator import MainCollator
+
+    base_tr = trainer.base
+    args = base_tr.args
+    base_tr.collate_fn = MainCollator(
+        pad_to_length=args.train.pad_to_length,
+        seq_classification=True,
+    )
+    base_tr._build_dataloader()
+
+
+def _maybe_patch_embedding_collator(trainer: Any, is_embedding_model: bool) -> None:
+    """Per-token binary task: keep labels aligned with ``input_ids`` (no causal label shift)."""
+    if not is_embedding_model:
         return
     from veomni.data.data_collator import MainCollator
 
@@ -1250,6 +1641,8 @@ def run_veomni(cfg: FinetuneConfig, train_parquet: str, eval_parquet: str | None
     sys.path.insert(0, str(_VEOMNI_SRC))
     if cfg.include_loss_from_input:
         _register_full_loss_text_target()
+    if cfg.is_embedding_model:
+        _register_text_per_token_binary()
 
     from veomni.arguments import parser as ve_parser
     from veomni.arguments.arguments_types import VeOmniArguments
@@ -1264,10 +1657,16 @@ def run_veomni(cfg: FinetuneConfig, train_parquet: str, eval_parquet: str | None
 
     trainer = TextTrainer(args)
     _maybe_patch_diffusion_lm_collator(trainer, cfg.diffusion_lm)
-    trainer.base.evaluate_callback = _build_parquet_eval_callback(
-        trainer.base, eval_parquet, cfg.eval_max_batches, cfg.diffusion_lm
-    )
-    _attach_veomni_lm_entropy_wandb(trainer)
+    _maybe_patch_embedding_collator(trainer, cfg.is_embedding_model)
+    if not cfg.is_embedding_model:
+        trainer.base.evaluate_callback = _build_parquet_eval_callback(
+            trainer.base, eval_parquet, cfg.eval_max_batches, cfg.diffusion_lm
+        )
+        _attach_veomni_lm_entropy_wandb(trainer)
+    else:
+        trainer.base.evaluate_callback = _build_embedding_eval_callback(
+            trainer.base, eval_parquet, cfg.eval_max_batches
+        )
     trainer.train()
 
     # After train(), distributed is torn down; LOCAL_RANK still identifies the primary process under torchrun.
@@ -1496,7 +1895,10 @@ def main() -> None:
 
     _maybe_reexec_torchrun(cfg)
 
-    train_rows, val_rows = build_pair_rows(cfg)
+    if cfg.is_embedding_model:
+        train_rows, val_rows = build_embedding_pair_rows(cfg)
+    else:
+        train_rows, val_rows = build_pair_rows(cfg)
     out_root = Path(cfg.checkpoint_output_dir).expanduser().resolve()
     out_root.mkdir(parents=True, exist_ok=True)
     train_pq = out_root / "prepared_train_pairs.parquet"

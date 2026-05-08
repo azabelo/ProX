@@ -1,0 +1,84 @@
+# Example config for finetuning/finetune.py with the per-token keep/discard objective
+# (model: qwen2_embedding — Qwen2.5-0.5B with the LAST decoder block dropped + a 1-D binary
+# classification head over hidden states).
+#
+# Pipeline summary:
+#   - Each (raw input chunk, OpenRouter rewritten chunk) pair is diffed via
+#     difflib.SequenceMatcher.get_opcodes() (same rule as
+#     openrouter_data_generation/view_nth_input_output_diff.py) to produce a per-character
+#     '0'/'1' keep mask of length(raw_chunk).
+#   - At tokenize-time (data_transform `text_per_token_binary`), the mask folds into a per-token
+#     0/1 label via logical AND: any deleted character in a token's offset span -> token = 0;
+#     otherwise 1. Tokens with empty offsets (special tokens) get IGNORE_INDEX.
+#   - Loss: BCEWithLogitsLoss per supervised token (no causal shift); collator runs in
+#     seq_classification mode so labels stay 1:1 aligned with input_ids.
+#
+# Run:
+#   python finetuning/finetune.py finetuning/example_finetune_embedding.yaml
+
+# Inline model_config is auto-derived from init_model_path when this is true:
+is_embedding_model: true
+
+model_arch: Qwen2EmbeddingForTokenClassification
+model_type: veomni_supported
+
+# Pretrained backbone weights are loaded by name from this path. Last-block + lm_head keys are
+# reported as "Unexpected key" by VeOmni's load_model_weights and skipped; the new `score` head
+# is randomly initialized via post_process_after_weight_loading -> _init_parameter.
+init_model_path: Qwen/Qwen2.5-0.5B
+tokenizer_path: null
+
+# resume_checkpoint_path: /home/ubuntu/ProX/finetuning_outputs/example_embedding_run_delete_only/checkpoints/global_step_30
+resume_checkpoint_path: None
+
+# Same shard/output layout as example_finetune.yaml. The OpenRouter outputs directory provides
+# the rewritten text used to compute keep/discard masks at row-build time (no big mask parquet
+# is written — the masks live in memory until tokenization).
+inputs_dir_path: data/raw/DCLM-baseline-one-shard/global-shard_01_of_10/local-shard_0_of_10
+outputs_dir_path: openrouter_output_data/delete_only
+
+dataset_type: dclm
+
+chunk_size: 1000
+is_code: false
+packing: false
+include_loss_from_input: false
+ensure_eos_on_target: false  # not used for embedding objective
+
+num_gpus: 8
+num_validation_documents: 50
+
+max_seq_len: 2048
+max_steps: 300
+num_train_epochs: 10
+global_batch_size: 8
+micro_batch_size: 1
+
+learning_rate: 5.0e-5
+weight_decay: 0.01
+warmup_ratio: 0.03
+lr_decay_style: cosine
+max_grad_norm: 1.0
+
+save_every_steps: 500
+eval_every_steps: 300
+eval_max_batches: 20
+
+checkpoint_output_dir: ./finetuning_outputs/example_embedding_run_delete_only
+
+seed: 42
+wandb_project: prox-finetune-embedding
+wandb_run_name: null
+
+gradient_checkpointing: true
+
+# Optional: explicit override for the Qwen2 embedding architecture. When omitted, finetune.py
+# autoloads Qwen/Qwen2.5-0.5B's HF config and rewrites model_type/architectures/tie_word_embeddings
+# and adds drop_last_n_layers: 1 (see _materialize_inline_model_config in finetune.py).
+# model_config:
+#   drop_last_n_layers: 1
+#   architectures: [Qwen2EmbeddingForTokenClassification]
+#   model_type: qwen2_embedding
+#   tie_word_embeddings: false
+
+veomni: {}

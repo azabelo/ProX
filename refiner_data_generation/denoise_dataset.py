@@ -1,7 +1,21 @@
 #!/usr/bin/env python3
 """
-Denoise web/code corpus shards with a local vLLM checkpoint (same chunking + chat pattern as
-``finetuning/finetune.py`` eval / OpenRouter generation).
+Denoise web/code corpus shards with a local model. Two pipelines share the same shard-iteration,
+chunking, batching, output, and resume scaffolding:
+
+  - **Autoregressive (default)**: load the model under vLLM and rewrite each chunk with greedy
+    generation (same chunking + chat pattern as ``finetuning/finetune.py`` eval / OpenRouter
+    generation).
+  - **Embedding (per-token binary keep/discard)**: set ``is_embedding_model: true`` to load the
+    finetuned ``Qwen2EmbeddingForTokenClassification`` model from
+    ``finetuning/finetune.py is_embedding_model: true`` runs. The pipeline does **not** use vLLM:
+    each chunk is tokenized with ``return_offsets_mapping=True``, run through the model, and the
+    chunk is reconstructed by concatenating the source characters covered by tokens whose binary
+    score-logit is greater than ``keep_logit_threshold`` (default ``0.0``; equivalent to
+    ``sigmoid(logit) > 0.5``). Tokens whose offset span is empty (special tokens) are skipped.
+
+Output schema (``{shard_stem}_denoised.parquet``) is identical for both pipelines so downstream
+tools (parquet readers, the OpenRouter-style viewer, etc.) need no changes.
 
 YAML keys (required unless noted):
   - input_parquet_dir: directory containing ``*.parquet`` or ``*.jsonl.zst`` shards (recursive)
@@ -19,7 +33,8 @@ YAML keys (required unless noted):
     ``<run_root>/.finetune_inline_config/config.json`` or ``model_assets`` from the same finetune run).
   - tokenizer_path: optional; defaults to merged/HF checkpoint dir — set explicitly when that dir has no tokenizer (typical for DCP→HF export + hub tokenizer)
   - output_data_dir, overwrite, continue, ...
-  - num_gpus: tensor parallel size for vLLM **per replica** (must divide model attention heads)
+  - num_gpus: tensor parallel size for vLLM **per replica** (must divide model attention heads).
+    Embedding mode does NOT use TP; set ``num_gpus: 1`` and use ``data_parallel_replicas`` for throughput.
   - data_parallel_replicas: number of independent full-model workers (each uses ``num_gpus`` GPUs with TP).
     Set to ``1`` (default) for a single process. Use ``8`` with ``num_gpus: 1`` for eight GPUs each running TP=1 (throughput on small models). Shards are partitioned round-robin across replicas; output files do not overlap.
   - data_parallel_gpu_ids: optional explicit CUDA device indices (length must equal ``data_parallel_replicas``); default ``0 .. replicas-1``
@@ -27,10 +42,17 @@ YAML keys (required unless noted):
   - max_parquets: max input shard files after sorting (-1 = all)
   - is_code: false = rewrite ``text`` / primary column with merged chunk outputs;
               true = fill ``programs_delimited`` + ``programs`` like OpenRouter code mode
-  - chunk_batch_size: number of chunk prompts per ``llm.generate`` call (throughput)
-  - max_new_tokens, max_model_len, trust_remote_code: generation / engine
+  - chunk_batch_size: number of chunks per forward pass (throughput).
+    Autoregressive mode → ``llm.generate`` batch; embedding mode → tokenizer + ``model(...)`` batch.
+  - max_new_tokens: autoregressive only — ignored in embedding mode.
+  - max_model_len: max prompt/forward sequence length. Autoregressive mode → vLLM ``max_model_len``;
+    embedding mode → tokenizer ``max_length=`` and the chunk's tail is dropped if truncated.
+  - trust_remote_code: generation / engine
   - metrics_interval_sec: periodic throughput logs (same style as OpenRouter runner)
-  - vllm: optional mapping of extra kwargs forwarded to ``vllm.LLM(...)``
+  - vllm: optional mapping of extra kwargs forwarded to ``vllm.LLM(...)`` (autoregressive only)
+  - is_embedding_model: bool (default false). Switch to the embedding (per-token keep/discard) pipeline.
+  - keep_logit_threshold: float (default 0.0). Embedding mode only. Tokens with score-logit greater
+    than this value are kept; everything else is dropped from the reconstructed chunk text.
 
 Environment:
   - PROX_DCP_MERGE_PYTHON — optional path to a Python executable for **DCP→HF merge only**
@@ -39,6 +61,9 @@ Environment:
     training env) with PyTorch≥2.4 and a compatible Transformers for VeOmni.
 
 The resolved YAML path is copied into ``output_data_dir`` at run start.
+
+Within each output shard parquet, rows are appended in **strict input row order** (same order as
+``iter_shard_rows``), even when chunk batches finish out of order across documents.
 
 Usage:
   python refiner_data_generation/denoise_dataset.py refiner_data_generation/example_denoise.yaml
@@ -132,6 +157,17 @@ _VEOMNI_AUTO_MAP_BY_MODEL_TYPE: dict[str, dict[str, str]] = {
         ),
         "AutoModelForCausalLM": (
             "veomni.models.transformers.test_everything.modeling_test_everything.TestEverythingForCausalLM"
+        ),
+    },
+    # Per-token binary classifier (Qwen2 backbone with last decoder block dropped + 1-D score head).
+    # Used by the embedding-mode denoise pipeline (no vLLM); we still register the auto_map so
+    # ``AutoConfig.from_pretrained`` works on the merged HF export.
+    "qwen2_embedding": {
+        "AutoConfig": (
+            "veomni.models.transformers.qwen2_embedding.configuration_qwen2_embedding.Qwen2EmbeddingConfig"
+        ),
+        "AutoModelForTokenClassification": (
+            "veomni.models.transformers.qwen2_embedding.modeling_qwen2_embedding.Qwen2EmbeddingForTokenClassification"
         ),
     },
 }
@@ -530,6 +566,8 @@ def output_effect_fingerprint(raw: dict[str, Any], *, shard_paths: list[Path]) -
         "model_arch": str(raw.get("model_arch", "auto")),
         "is_code": raw.get("is_code"),
         "max_new_tokens": int(raw.get("max_new_tokens", 4096)),
+        "is_embedding_model": _boolish(raw.get("is_embedding_model", False)),
+        "keep_logit_threshold": float(raw.get("keep_logit_threshold", 0.0)),
         "input_shards": [str(p.resolve()) for p in shard_paths],
     }
     return hashlib.sha256(json.dumps(blob, sort_keys=True, default=str).encode()).hexdigest()
@@ -555,6 +593,8 @@ def output_resume_fingerprint(raw: dict[str, Any], *, shard_paths: list[Path]) -
         "model_arch": str(raw.get("model_arch", "auto")),
         "is_code": raw.get("is_code"),
         "max_new_tokens": int(raw.get("max_new_tokens", 4096)),
+        "is_embedding_model": _boolish(raw.get("is_embedding_model", False)),
+        "keep_logit_threshold": float(raw.get("keep_logit_threshold", 0.0)),
         "input_shards": [str(p.resolve()) for p in shard_paths],
     }
     return hashlib.sha256(json.dumps(blob, sort_keys=True, default=str).encode()).hexdigest()
@@ -726,6 +766,13 @@ def _parse_cfg(raw: dict[str, Any], cfg_path: Path) -> Any:
             trust_remote_code=_boolish(raw.get("trust_remote_code", True)),
             metrics_interval_sec=float(raw.get("metrics_interval_sec", 15.0)),
             vllm_extras=dict(raw["vllm"]) if isinstance(raw.get("vllm"), dict) else {},
+            # Embedding (per-token binary keep/discard) pipeline flags. When ``is_embedding_model``
+            # is True, the script bypasses vLLM and loads the finetuned token-classification model
+            # with ``transformers`` + PyTorch (HuggingFace ``Qwen2EmbeddingForTokenClassification``).
+            # Each chunk is tokenized with ``return_offsets_mapping=True``; tokens whose score-logit
+            # is at most ``keep_logit_threshold`` are dropped from the reconstructed chunk text.
+            is_embedding_model=_boolish(raw.get("is_embedding_model", False)),
+            keep_logit_threshold=float(raw.get("keep_logit_threshold", 0.0)),
         )
     except KeyError as e:
         raise SystemExit(f"Missing required config key: {e}") from e
@@ -760,20 +807,29 @@ def _dp_worker_main(
     log_prefix = f"[dp {replica_idx + 1}/{n_replicas}] "
     print(
         f"{log_prefix}visible GPU map: physical cuda:{gpu_id} -> worker cuda:0 "
-        f"shards={len(shard_paths)}",
+        f"shards={len(shard_paths)} mode={'embedding' if cfg.is_embedding_model else 'denoise(vllm)'}",
         flush=True,
     )
     if not shard_paths:
         return
     _ensure_veomni_on_path()
     resolved_ckpt = _resolve_model_checkpoint_for_vllm(cfg.model_checkpoint_path)
-    _execute_denoise_pipeline(
-        cfg,
-        shard_paths,
-        resolved_ckpt,
-        resume_ok=False,
-        log_prefix=log_prefix,
-    )
+    if cfg.is_embedding_model:
+        _execute_embedding_pipeline(
+            cfg,
+            shard_paths,
+            resolved_ckpt,
+            resume_ok=False,
+            log_prefix=log_prefix,
+        )
+    else:
+        _execute_denoise_pipeline(
+            cfg,
+            shard_paths,
+            resolved_ckpt,
+            resume_ok=False,
+            log_prefix=log_prefix,
+        )
 
 
 def _run_data_parallel(
@@ -787,10 +843,17 @@ def _run_data_parallel(
     resolved_ckpt = _resolve_model_checkpoint_for_vllm(cfg.model_checkpoint_path)
     print(
         f"[init] data_parallel_replicas={cfg.data_parallel_replicas} "
-        f"tensor_parallel_per_replica={cfg.num_gpus}",
+        f"tensor_parallel_per_replica={cfg.num_gpus} "
+        f"mode={'embedding' if cfg.is_embedding_model else 'denoise(vllm)'}",
         flush=True,
     )
-    print(f"[init] vLLM model path (resolved, pre-workers): {resolved_ckpt}", flush=True)
+    if cfg.is_embedding_model:
+        print(
+            f"[init] HuggingFace model path (resolved, pre-workers, embedding mode): {resolved_ckpt}",
+            flush=True,
+        )
+    else:
+        print(f"[init] vLLM model path (resolved, pre-workers): {resolved_ckpt}", flush=True)
 
     R = int(cfg.data_parallel_replicas)
     ctx = mp.get_context("spawn")
@@ -920,6 +983,16 @@ def _execute_denoise_pipeline(
             return True
         return False
 
+    def _drain_shard_row_buffer(wb: dict[str, Any]) -> None:
+        """Move completed rows from ``_pending_by_row`` to ``rows`` in ascending ``row_idx`` order."""
+        pend: dict[int, Any] = wb["_pending_by_row"]
+        nxt: int = wb["_next_emit_row"]
+        rows_list: list[Any] = wb["rows"]
+        while nxt in pend:
+            rows_list.append(pend.pop(nxt))
+            nxt += 1
+        wb["_next_emit_row"] = nxt
+
     def process_chunk_batch(
         jobs: list[_ChunkJob],
         trackers: dict[tuple[str, int], RowAccum],
@@ -979,7 +1052,8 @@ def _execute_denoise_pipeline(
                 chunk_parts=parts,
             )
             writer_bundle = shard_writers[key[0]]
-            writer_bundle["rows"].append(merged)
+            writer_bundle["_pending_by_row"][acc.row_idx] = merged
+            _drain_shard_row_buffer(writer_bundle)
             metrics.add_doc()
             with run_lock:
                 inflight_docs -= 1
@@ -1006,7 +1080,11 @@ def _execute_denoise_pipeline(
         if resume_ok and out_path.is_file():
             n_existing = pq.ParquetFile(out_path).metadata.num_rows
 
-        writers_state: dict[str, Any] = {"rows": []}
+        writers_state: dict[str, Any] = {
+            "rows": [],
+            "_pending_by_row": {},
+            "_next_emit_row": n_existing,
+        }
         shard_writers[pq_path.name] = writers_state
 
         row_iter = enumerate(iter_shard_rows(pq_path))
@@ -1049,7 +1127,8 @@ def _execute_denoise_pipeline(
                     full_source_text=text,
                     chunk_parts=[],
                 )
-                writers_state["rows"].append(merged)
+                writers_state["_pending_by_row"][row_idx] = merged
+                _drain_shard_row_buffer(writers_state)
                 metrics.add_doc()
                 global_docs += 1
                 global_chars += doc_len
@@ -1097,10 +1176,19 @@ def _execute_denoise_pipeline(
                 break
 
         flush_batch()
+        _drain_shard_row_buffer(writers_state)
 
         # Write shard parquet
-        st = shard_writers.pop(pq_path.name, {"rows": []})
+        st = shard_writers.pop(pq_path.name, {"rows": [], "_pending_by_row": {}, "_next_emit_row": 0})
         rows_out = st["rows"]
+        pend_left = st.get("_pending_by_row") or {}
+        if pend_left:
+            nxt = int(st.get("_next_emit_row", 0))
+            raise RuntimeError(
+                f"Internal alignment error for {pq_path.name}: {len(pend_left)} row(s) merged but not "
+                f"emitted (next_emit_row={nxt}, pending_keys={sorted(pend_left.keys())}). "
+                "Likely incomplete chunk work at shard end."
+            )
         if resume_ok and n_existing and rows_out:
             old = pq.read_table(out_path).to_pylist()
             rows_out = old + rows_out
@@ -1138,6 +1226,438 @@ def _execute_denoise_pipeline(
         f"api_toks={api_part} "
         f"parquets={snap['completed_parquets']} "
         f"prompt_tok={snap['prompt_tokens']} completion_tok={snap['completion_tokens']} "
+        f"out_dir={cfg.output_data_dir}",
+        flush=True,
+    )
+
+
+def _execute_embedding_pipeline(
+    cfg: Any,
+    shard_paths: list[Path],
+    resolved_ckpt: str,
+    *,
+    resume_ok: bool,
+    log_prefix: str = "",
+) -> None:
+    """Per-token binary keep/discard pipeline (no vLLM).
+
+    Loads ``Qwen2EmbeddingForTokenClassification`` (the ``qwen2_embedding`` model from
+    ``finetuning/finetune.py`` with ``is_embedding_model: true``) using HuggingFace transformers
+    + PyTorch and produces denoised text by **dropping characters** belonging to tokens whose
+    binary score-logit falls at or below ``cfg.keep_logit_threshold`` (default ``0.0``, i.e.
+    ``sigmoid(logit) > 0.5``).
+
+    For each chunk of size ``cfg.chunk_size`` characters:
+      1. Tokenize with ``add_special_tokens=False`` and ``return_offsets_mapping=True`` (matches
+         the ``text_per_token_binary`` data transform used at training time).
+      2. Run the model's forward pass (no causal LM, no generation): the score head emits a
+         scalar logit per token.
+      3. Reconstruct the chunk by concatenating ``chunk[s:e]`` for every kept token whose offset
+         span ``(s, e)`` is non-empty.
+
+    The output schema and shard partitioning are identical to ``_execute_denoise_pipeline`` so
+    downstream code (parquet readers, ``data_parallel_replicas`` round-robin sharding, resume,
+    etc.) does not change.
+    """
+    row_text_fn: Callable[[dict[str, Any]], str] = get_row_text_fn(cfg.dataset_type)
+
+    import torch
+    from transformers import AutoTokenizer
+
+    # transformers>=4.51 (and even some 4.50 dev tags) call ``torch.get_default_device()`` inside
+    # ``PreTrainedModel.from_pretrained`` -> ``get_torch_context_manager_or_global_device``.
+    # That helper was added in PyTorch 2.3; the ``refining`` conda env (built for vLLM) commonly
+    # pins an older torch, so the call raises ``AttributeError`` before any weights are loaded.
+    # Polyfill matches the upstream default (no ``torch.set_default_device`` call -> CPU).
+    if not hasattr(torch, "get_default_device"):
+        def _polyfill_get_default_device() -> "torch.device":
+            return torch.tensor([]).device
+        torch.get_default_device = _polyfill_get_default_device  # type: ignore[attr-defined]
+
+    _ensure_veomni_on_path()
+    from veomni.models.transformers.qwen2_embedding.configuration_qwen2_embedding import (
+        Qwen2EmbeddingConfig,
+    )
+    from veomni.models.transformers import qwen2_embedding as _qwen2emb_pkg  # noqa: F401  (path init)
+    from veomni.models.transformers.qwen2_embedding import (
+        modeling_qwen2_embedding as _qwen2emb_mod,
+    )
+    from veomni.models.transformers.qwen2_embedding.modeling_qwen2_embedding import (
+        Qwen2EmbeddingForTokenClassification,
+    )
+
+    # The qwen2 backbone uses ``_import_qwen2_model`` which (on transformers < 5) imports
+    # ``apply_veomni_qwen2_patch``. That patch module imports ``TransformersKwargs`` from
+    # ``transformers.utils`` — symbol added in transformers ~4.55, missing in the ``refining``
+    # conda env (4.52). The patch is for FlashAttention/sequence-parallel niceties; pure
+    # inference is correct with the stock HuggingFace ``Qwen2Model``. Fall back when the
+    # patch import is unavailable so the embedding pipeline runs in older environments too.
+    try:
+        _qwen2emb_mod._import_qwen2_model()
+    except (ImportError, AttributeError) as _e:
+        from transformers import Qwen2Model as _HF_Qwen2Model
+
+        _qwen2emb_mod._import_qwen2_model = lambda: _HF_Qwen2Model
+        print(
+            f"{log_prefix}[init] VeOmni qwen2 patch unavailable in this env "
+            f"({type(_e).__name__}: {_e}); falling back to stock transformers ``Qwen2Model`` "
+            "for inference (FlashAttention/SP patches not required for the per-token classifier).",
+            flush=True,
+        )
+
+    tok_path = cfg.tokenizer_path or resolved_ckpt
+    tokenizer = AutoTokenizer.from_pretrained(
+        tok_path, trust_remote_code=cfg.trust_remote_code, use_fast=True
+    )
+    if not getattr(tokenizer, "is_fast", False):
+        raise SystemExit(
+            "Embedding pipeline requires a fast tokenizer (offset_mapping). "
+            f"Tokenizer at {tok_path!r} is slow; install ``tokenizers`` or pass a different "
+            "``tokenizer_path``."
+        )
+    if tokenizer.pad_token_id is None and tokenizer.eos_token_id is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    config = Qwen2EmbeddingConfig.from_pretrained(resolved_ckpt)
+    model_dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    model = Qwen2EmbeddingForTokenClassification.from_pretrained(
+        resolved_ckpt,
+        config=config,
+        torch_dtype=model_dtype,
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
+    model.eval()
+    print(
+        f"{log_prefix}[init] embedding model loaded: {type(model).__name__} "
+        f"hidden={config.hidden_size} layers={config.num_hidden_layers} "
+        f"dtype={model_dtype} device={device} threshold={cfg.keep_logit_threshold}",
+        flush=True,
+    )
+
+    threshold = float(getattr(cfg, "keep_logit_threshold", 0.0))
+    max_len = int(cfg.max_model_len)
+
+    @torch.no_grad()
+    def predict_kept_chunks(chunks_text: list[str]) -> tuple[list[str], int, int]:
+        """Run one forward pass over a batch of chunk strings.
+
+        Returns ``(kept_text_per_chunk, total_input_tokens, n_truncated_chunks)``.
+        """
+        if not chunks_text:
+            return [], 0, 0
+        enc = tokenizer(
+            chunks_text,
+            add_special_tokens=False,
+            return_offsets_mapping=True,
+            truncation=True,
+            max_length=max_len,
+            padding=True,
+            return_tensors="pt",
+        )
+        input_ids = enc["input_ids"].to(device, non_blocking=True)
+        attention_mask = enc["attention_mask"].to(device, non_blocking=True)
+        offsets = enc["offset_mapping"]
+        offsets_list = offsets.tolist() if torch.is_tensor(offsets) else offsets
+
+        out = model(input_ids=input_ids, attention_mask=attention_mask)
+        logits = out.logits  # [B, L]
+        keep_bool = (logits > threshold).cpu().tolist()
+        am = attention_mask.cpu().tolist()
+        n_input_tokens = int(attention_mask.sum().item())
+
+        n_truncated = 0
+        results: list[str] = []
+        for i, chunk in enumerate(chunks_text):
+            kept_parts: list[str] = []
+            covered_end = 0
+            for tok_i in range(len(am[i])):
+                if not am[i][tok_i]:
+                    continue
+                s, e = offsets_list[i][tok_i]
+                if e <= s:
+                    continue
+                if e > covered_end:
+                    covered_end = e
+                if keep_bool[i][tok_i]:
+                    kept_parts.append(chunk[s:e])
+            if covered_end < len(chunk):
+                # Tokenizer truncation dropped the tail; the discarded tail is treated as
+                # "not kept" (matches training, which truncates labels to ``max_seq_len`` too).
+                n_truncated += 1
+            results.append("".join(kept_parts))
+        return results, n_input_tokens, n_truncated
+
+    wall0 = time.perf_counter()
+    last_wall = [wall0]
+
+    global_docs = 0
+    global_chars = 0
+    global_chunks = 0
+    inflight_docs = 0
+    run_lock = threading.Lock()
+
+    shard_writers: dict[str, dict[str, Any]] = {}
+    input_row_by_key: dict[tuple[str, int], dict[str, Any]] = {}
+    pending_jobs: list[_ChunkJob] = []
+    pending_trackers: dict[tuple[str, int], RowAccum] = {}
+
+    metrics = Metrics()
+    metrics.total_parquets = len(shard_paths)
+    try:
+        row_total = sum(precount_doc_rows([p]) for p in shard_paths)
+    except Exception as e:
+        print(f"{log_prefix}[init] row precount skipped: {e}", flush=True)
+        row_total = -1
+    try:
+        parquet_chars, parquet_tok_est = precount_chars_and_token_est(
+            shard_paths, row_text_fn
+        )
+    except Exception as e:
+        print(f"{log_prefix}[init] char/token precount skipped: {e}", flush=True)
+        parquet_chars, parquet_tok_est = -1, -1
+    metrics.doc_denom = _doc_denom(cfg.max_docs, row_total)
+    metrics.char_denom = _char_denom(cfg.max_chars, parquet_chars)
+    metrics.api_tok_denom = _api_tok_denom(cfg.max_tokens, parquet_tok_est)
+    chunk_denom = cfg.max_chunks if cfg.max_chunks >= 0 else -1
+    setattr(metrics, "chunk_denom", chunk_denom)
+
+    def caps_hit() -> bool:
+        if cfg.max_docs >= 0 and global_docs + inflight_docs >= cfg.max_docs:
+            return True
+        if cfg.max_chars >= 0 and global_chars >= cfg.max_chars:
+            return True
+        if cfg.max_chunks >= 0 and global_chunks >= cfg.max_chunks:
+            return True
+        return False
+
+    def _drain_shard_row_buffer(wb: dict[str, Any]) -> None:
+        pend: dict[int, Any] = wb["_pending_by_row"]
+        nxt: int = wb["_next_emit_row"]
+        rows_list: list[Any] = wb["rows"]
+        while nxt in pend:
+            rows_list.append(pend.pop(nxt))
+            nxt += 1
+        wb["_next_emit_row"] = nxt
+
+    def process_chunk_batch(
+        jobs: list[_ChunkJob],
+        trackers: dict[tuple[str, int], RowAccum],
+        metrics: Metrics,
+    ) -> None:
+        nonlocal global_chunks, global_docs, global_chars, inflight_docs
+        if not jobs:
+            return
+        chunks_text = [j.prompt for j in jobs]
+        kept_texts, n_input_tok, n_truncated = predict_kept_chunks(chunks_text)
+        # Embedding mode has no completion tokens; report only input tokens via ``add_usage``.
+        metrics.add_usage(n_input_tok, 0)
+
+        if n_truncated:
+            print(
+                f"{log_prefix}[warn] {n_truncated}/{len(jobs)} chunk(s) hit max_model_len="
+                f"{cfg.max_model_len}; the trailing characters were tokenizer-truncated and "
+                "dropped from output.",
+                flush=True,
+            )
+
+        done_keys: set[tuple[str, int]] = set()
+        for job, kept in zip(jobs, kept_texts):
+            acc = trackers[(job.pq_name, job.row_idx)]
+            if acc.parts[job.chunk_idx] is not None:
+                raise RuntimeError("duplicate chunk slot")
+            acc.parts[job.chunk_idx] = kept if isinstance(kept, str) else ""
+            with run_lock:
+                global_chunks += 1
+            key = (job.pq_name, job.row_idx)
+            if all(p is not None for p in trackers[key].parts):
+                done_keys.add(key)
+
+        for key in done_keys:
+            acc = trackers.pop(key)
+            parts = [p if isinstance(p, str) else "" for p in acc.parts]
+            row_out = input_row_by_key.pop(key, None)
+            if row_out is None:
+                continue
+            merged = _merge_denoised_into_row(
+                row_out,
+                dataset_type=cfg.dataset_type,
+                is_code=cfg.is_code,
+                full_source_text=acc.full_text,
+                chunk_parts=parts,
+            )
+            writer_bundle = shard_writers[key[0]]
+            writer_bundle["_pending_by_row"][acc.row_idx] = merged
+            _drain_shard_row_buffer(writer_bundle)
+            metrics.add_doc()
+            with run_lock:
+                inflight_docs -= 1
+                global_docs += 1
+                global_chars += acc.doc_len
+            _maybe_print_metrics(
+                cfg,
+                metrics,
+                wall0=wall0,
+                last_wall=last_wall,
+                global_chars=global_chars,
+                global_chunks=global_chunks,
+                log_prefix=log_prefix,
+            )
+
+    for pq_path in shard_paths:
+        out_name = f"{pq_path.stem}_denoised.parquet"
+        out_path = cfg.output_data_dir / out_name
+
+        if out_path.exists() and not cfg.overwrite and not resume_ok:
+            raise SystemExit(f"Output exists: {out_path}")
+
+        n_existing = 0
+        if resume_ok and out_path.is_file():
+            n_existing = pq.ParquetFile(out_path).metadata.num_rows
+
+        writers_state: dict[str, Any] = {
+            "rows": [],
+            "_pending_by_row": {},
+            "_next_emit_row": n_existing,
+        }
+        shard_writers[pq_path.name] = writers_state
+
+        row_iter = enumerate(iter_shard_rows(pq_path))
+
+        def flush_batch() -> None:
+            if not pending_jobs:
+                return
+            process_chunk_batch(pending_jobs, pending_trackers, metrics)
+            pending_jobs.clear()
+
+        for row_idx, row in row_iter:
+            if row_idx < n_existing:
+                continue
+            if caps_hit():
+                break
+
+            text = row_text_fn(row)
+            doc_len = len(text)
+            with run_lock:
+                if cfg.max_docs >= 0 and global_docs + inflight_docs >= cfg.max_docs:
+                    break
+                if cfg.max_chars >= 0 and global_chars + doc_len > cfg.max_chars:
+                    break
+                if cfg.max_chunks >= 0 and global_chunks >= cfg.max_chunks:
+                    break
+
+            chunks = chunk_text(text, cfg.chunk_size)
+            if cfg.max_chunks >= 0:
+                budget = cfg.max_chunks - global_chunks
+                if budget <= 0:
+                    break
+                if len(chunks) > budget:
+                    chunks = chunks[:budget]
+
+            if not chunks:
+                merged = _merge_denoised_into_row(
+                    row,
+                    dataset_type=cfg.dataset_type,
+                    is_code=cfg.is_code,
+                    full_source_text=text,
+                    chunk_parts=[],
+                )
+                writers_state["_pending_by_row"][row_idx] = merged
+                _drain_shard_row_buffer(writers_state)
+                metrics.add_doc()
+                global_docs += 1
+                global_chars += doc_len
+                _maybe_print_metrics(
+                    cfg,
+                    metrics,
+                    wall0=wall0,
+                    last_wall=last_wall,
+                    global_chars=global_chars,
+                    global_chunks=global_chunks,
+                    log_prefix=log_prefix,
+                )
+                continue
+
+            key = (pq_path.name, row_idx)
+            tr = RowAccum(
+                pq_name=pq_path.name,
+                row_idx=row_idx,
+                n_chunks=len(chunks),
+                full_text=text,
+                doc_len=doc_len,
+                parts=[None] * len(chunks),
+            )
+            pending_trackers[key] = tr
+            input_row_by_key[key] = row
+            with run_lock:
+                inflight_docs += 1
+
+            for cidx, ch in enumerate(chunks):
+                pending_jobs.append(
+                    _ChunkJob(
+                        pq_name=pq_path.name,
+                        row_idx=row_idx,
+                        chunk_idx=cidx,
+                        n_chunks=len(chunks),
+                        doc_len=doc_len,
+                        prompt=ch,
+                    )
+                )
+                if len(pending_jobs) >= cfg.chunk_batch_size:
+                    flush_batch()
+
+            if caps_hit():
+                flush_batch()
+                break
+
+        flush_batch()
+        _drain_shard_row_buffer(writers_state)
+
+        st = shard_writers.pop(pq_path.name, {"rows": [], "_pending_by_row": {}, "_next_emit_row": 0})
+        rows_out = st["rows"]
+        pend_left = st.get("_pending_by_row") or {}
+        if pend_left:
+            nxt = int(st.get("_next_emit_row", 0))
+            raise RuntimeError(
+                f"Internal alignment error for {pq_path.name}: {len(pend_left)} row(s) merged but not "
+                f"emitted (next_emit_row={nxt}, pending_keys={sorted(pend_left.keys())}). "
+                "Likely incomplete chunk work at shard end."
+            )
+        if resume_ok and n_existing and rows_out:
+            old = pq.read_table(out_path).to_pylist()
+            rows_out = old + rows_out
+        if rows_out:
+            table = pa.Table.from_pylist(rows_out)
+            pq.write_table(table, out_path)
+
+        metrics.add_parquet_done()
+        _maybe_print_metrics(
+            cfg,
+            metrics,
+            wall0=wall0,
+            last_wall=last_wall,
+            global_chars=global_chars,
+            global_chunks=global_chunks,
+            log_prefix=log_prefix,
+        )
+
+        if caps_hit():
+            break
+
+    elapsed = time.perf_counter() - wall0
+    snap = metrics.snapshot()
+    toks_done = snap["prompt_tokens"] + snap["completion_tokens"]
+    doc_d = metrics.doc_denom
+    ch_d = metrics.char_denom
+    api_d = metrics.api_tok_denom
+    doc_part = f"{snap['completed_docs']}/{doc_d}" if doc_d >= 0 else f"{snap['completed_docs']}/?"
+    ch_part = f"{global_chars}/{ch_d}" if ch_d >= 0 else f"{global_chars}/?"
+    api_part = f"{toks_done}/{api_d}" if api_d >= 0 else f"{toks_done}/?"
+    ch_lim = getattr(metrics, "chunk_denom", -1)
+    ch_run = f"{global_chunks}/{ch_lim}" if ch_lim >= 0 else f"{global_chunks}/?"
+    print(
+        f"{log_prefix}[done][embedding] wall={elapsed:.2f}s docs={doc_part} chars={ch_part} "
+        f"chunks={ch_run} input_toks={api_part} parquets={snap['completed_parquets']} "
         f"out_dir={cfg.output_data_dir}",
         flush=True,
     )
@@ -1241,12 +1761,14 @@ def run(cfg_path: Path) -> None:
     chunk_denom = cfg.max_chunks if cfg.max_chunks >= 0 else -1
     setattr(metrics, "chunk_denom", chunk_denom)
 
+    mode_label = "embedding (per-token keep/discard)" if cfg.is_embedding_model else "denoise (autoregressive)"
     print(
-        f"[init] checkpoint={cfg.model_checkpoint_path!r} arch={cfg.model_arch!r} "
+        f"[init] mode={mode_label} checkpoint={cfg.model_checkpoint_path!r} arch={cfg.model_arch!r} "
         f"shards={len(shard_paths)} chunk_size={cfg.chunk_size} "
         f"max_docs={cfg.max_docs} max_chars={cfg.max_chars} max_chunks={cfg.max_chunks} "
         f"max_tokens={cfg.max_tokens} tensor_parallel={cfg.num_gpus} "
-        f"data_parallel_replicas={cfg.data_parallel_replicas} is_code={cfg.is_code}",
+        f"data_parallel_replicas={cfg.data_parallel_replicas} is_code={cfg.is_code} "
+        f"keep_logit_threshold={cfg.keep_logit_threshold}",
         flush=True,
     )
     print(
@@ -1289,8 +1811,18 @@ def run(cfg_path: Path) -> None:
 
     _ensure_veomni_on_path()
     resolved_ckpt = _resolve_model_checkpoint_for_vllm(cfg.model_checkpoint_path)
-    print(f"[init] vLLM model path (resolved): {resolved_ckpt}", flush=True)
+    if cfg.is_embedding_model:
+        print(f"[init] HuggingFace model path (resolved, embedding mode): {resolved_ckpt}", flush=True)
+        _execute_embedding_pipeline(
+            cfg,
+            shard_paths,
+            resolved_ckpt,
+            resume_ok=resume_ok,
+            log_prefix="",
+        )
+        return
 
+    print(f"[init] vLLM model path (resolved): {resolved_ckpt}", flush=True)
     _execute_denoise_pipeline(
         cfg,
         shard_paths,

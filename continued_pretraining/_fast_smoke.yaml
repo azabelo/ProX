@@ -1,0 +1,42 @@
+# Short smoke for single-H100 fast path (FlashAttention + large rectangular micro-batch)
+init_model_path: Qwen/Qwen2.5-0.5B
+inputs_dir_path: data/raw/DCLM-baseline-one-shard/global-shard_01_of_10/local-shard_0_of_10
+dataset_type: dclm
+num_validation_documents: 4
+max_input_documents: 2048
+train_token_oversample: 1.0
+chars_per_token: 4.0
+
+max_training_tokens: 1179648
+max_steps: 12
+num_train_epochs: 1
+max_seq_len: 2048
+global_batch_size: 48
+micro_batch_size: 48
+packing: false
+attn_implementation: auto
+
+learning_rate: 1e-5
+weight_decay: 0.0
+warmup_ratio: 0.0
+lr_decay_style: constant
+max_grad_norm: 1.0
+
+num_gpus: 1
+fsdp_mode: ddp
+gradient_checkpointing: false
+dataloader_num_workers: 16
+dataloader_prefetch_factor: 4
+
+save_every_steps: 10000
+eval_every_steps: 0
+eval_max_batches: 2
+
+checkpoint_output_dir: ./continued_pretraining_outputs/_fast_smoke_h100
+seed: 42
+wandb_project: prox-continue-pretraining
+wandb_run_name: _fast_smoke
+veomni_overrides:
+  train:
+    wandb:
+      enable: false

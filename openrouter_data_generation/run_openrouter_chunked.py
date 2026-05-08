@@ -55,7 +55,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -380,6 +380,7 @@ def _openrouter_one_chunk(
     source_row_index: int | None = None,
     chunk_index0: int | None = None,
     n_chunks: int | None = None,
+    quiet: bool = False,
 ) -> tuple[str, int, int, str]:
     user_content = f"{prompt_prefix}\n\n{chunk_body}"
     return openrouter_chat(
@@ -394,6 +395,7 @@ def _openrouter_one_chunk(
         warn_source_row_index=source_row_index,
         warn_chunk_index0=chunk_index0,
         warn_n_chunks=n_chunks,
+        quiet=quiet,
     )
 
 
@@ -487,6 +489,7 @@ def openrouter_chat(
     warn_source_row_index: int | None = None,
     warn_chunk_index0: int | None = None,
     warn_n_chunks: int | None = None,
+    quiet: bool = False,
 ) -> tuple[str, int, int, str]:
     payload: dict[str, Any] = {
         "model": model,
@@ -553,14 +556,15 @@ def openrouter_chat(
         ):
             loc_parts.append(f"chunk={warn_chunk_index0 + 1}/{warn_n_chunks}")
         loc_s = (" " + " ".join(loc_parts)) if loc_parts else ""
-        print(
-            "[warn] OpenRouter returned empty assistant ``content`` for this chunk "
-            f"(finish_reason={finish_reason!r}, completion_tokens={ct}, prompt_tokens={pt}).{loc_s} "
-            "With a very small ``openrouter.max_tokens``, some models spend the whole budget "
-            "on internal reasoning and never emit visible text—try raising max_tokens, "
-            "using a non-reasoning model, or shrinking ``chunk_size``.",
-            flush=True,
-        )
+        if not quiet:
+            print(
+                "[warn] OpenRouter returned empty assistant ``content`` for this chunk "
+                f"(finish_reason={finish_reason!r}, completion_tokens={ct}, prompt_tokens={pt}).{loc_s} "
+                "With a very small ``openrouter.max_tokens``, some models spend the whole budget "
+                "on internal reasoning and never emit visible text—try raising max_tokens, "
+                "using a non-reasoning model, or shrinking ``chunk_size``.",
+                flush=True,
+            )
 
     return content, pt, ct, finish_reason
 
@@ -717,6 +721,9 @@ class ViewPaths:
     data_parquet_type: str
     data_output_dir: Path
     max_parquets: int
+    #: Optional earlier corpus (same shard filenames / row order as ``data_parquet_dir``).
+    #: When set, HTML diff can separate **output-stage** edits (raw→middle) from **OpenRouter** (middle→final).
+    raw_parquet_dir: Path | None = None
 
 
 def parse_view_paths(raw: dict[str, Any]) -> ViewPaths:
@@ -738,11 +745,18 @@ def parse_view_paths(raw: dict[str, Any]) -> ViewPaths:
         )
     dtype = raw.get("data_parquet_type") or raw.get("dataset_type") or "fineweb"
     max_parquets = int(raw.get("max_parquets", -1))
+    raw_dp = raw.get("diff_raw_parquet_dir") or raw.get("raw_input_parquet_dir")
+    raw_path = (
+        Path(os.path.expanduser(str(raw_dp))).resolve()
+        if raw_dp is not None
+        else None
+    )
     return ViewPaths(
         data_parquet_dir=Path(os.path.expanduser(str(dp))).resolve(),
         data_parquet_type=str(dtype),
         data_output_dir=Path(os.path.expanduser(str(out))).resolve(),
         max_parquets=max_parquets,
+        raw_parquet_dir=raw_path,
     )
 
 
@@ -774,6 +788,32 @@ def precount_doc_rows(shard_paths: list[Path]) -> int:
         else:
             raise ValueError(f"Unsupported shard for row count: {p}")
     return total
+
+
+def _nth_row_from_shard(shard_path: Path, local_idx: int) -> dict[str, Any]:
+    if local_idx < 0:
+        raise IndexError("local row index must be non-negative")
+    for i, row in enumerate(iter_shard_rows(shard_path)):
+        if i == local_idx:
+            return row
+    raise IndexError(f"row {local_idx} out of range in {shard_path}")
+
+
+def _resolve_global_doc_index(shard_paths: list[Path], global_idx: int) -> tuple[Path, int]:
+    """Map global 0-based document index across ``shard_paths`` to (shard_path, local_row_index)."""
+    if global_idx < 0:
+        raise IndexError("global document index must be non-negative")
+    rem = global_idx
+    for sp in shard_paths:
+        nr = precount_doc_rows([sp])
+        if rem < nr:
+            return sp, rem
+        rem -= nr
+    total = sum(precount_doc_rows([p]) for p in shard_paths)
+    raise IndexError(
+        f"global document index {global_idx} out of range "
+        f"(≈{total} rows across {len(shard_paths)} shard(s))"
+    )
 
 
 def precount_chars_and_token_est(
@@ -1197,7 +1237,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("yaml_config", type=Path, help="Path to YAML config file.")
     args = ap.parse_args()
-    os.chdir(Path(__file__).resolve().parents[1])
+    repo_root = Path(__file__).resolve().parents[1]
+    os.chdir(repo_root)
+
     run(args.yaml_config.expanduser().resolve())
 
 

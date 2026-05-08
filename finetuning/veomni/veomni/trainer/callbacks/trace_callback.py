@@ -297,9 +297,10 @@ class EnvironMeterCallback(Callback):
             lr = max(self.trainer.lr_scheduler.get_last_lr())
             step_train_metrics["training/lr"] = lr
 
-        n_micro = max(getattr(self.trainer, "last_step_num_micro_batches", 1), 1)
         if "training/foundation_loss" in step_train_metrics:
-            mean_foundation = step_train_metrics["training/foundation_loss"] / n_micro
+            # ``foundation_loss`` is already aggregated across micro-batches as a token-weighted global
+            # mean CE for the step (see ``mean_global_loss`` + summation in ``TextTrainer.train_step``).
+            mean_foundation = step_train_metrics["training/foundation_loss"]
             step_train_metrics["training/mean_foundation_loss"] = mean_foundation
             # Token perplexity ≈ exp(mean CE loss) when loss is cross-entropy in nats (natural log).
             step_train_metrics["training/perplexity"] = float(math.exp(min(mean_foundation, 80.0)))

@@ -3,6 +3,10 @@
 # Run:
 #   export OPENROUTER_API_KEY=sk-or-...
 #   python openrouter_data_generation/run_openrouter_chunked.py openrouter_data_generation/example_openrouter_rewrite.yaml
+#
+# One live OpenRouter document (HTML diff; chunk lines in terminal; no parquet) — use the viewer, not the batch runner:
+#   python openrouter_data_generation/view_nth_input_output_diff.py refiner_data_generation/example_denoise.yaml 0 --live-query
+#   # optional: --query-model-yaml openrouter_data_generation/example_openrouter_rewrite.yaml
 
 model: openai/gpt-oss-120b
 
@@ -28,9 +32,13 @@ data_parquet_dir: data/raw/DCLM-baseline-one-shard/global-shard_01_of_10/local-s
 # One of: fineweb | dclm | redpajama | redpajama-v2 | passthrough
 data_parquet_type: dclm
 
+# Optional: raw corpus dir with the same shard filenames as ``data_parquet_dir`` (see ``parse_view_paths``).
+# When set, ``view_nth_input_output_diff.py`` / ``print_nth_input_output.py`` compare raw → middle (this row) → OpenRouter output.
+# diff_raw_parquet_dir: ...
+
 chunk_size: 1000
 max_chars: 10000000
-max_docs: 1000
+max_docs: 300
 max_parquets: 2
 
 # Output is always a directory; shard parquets are written inside it.
@@ -38,7 +46,7 @@ max_parquets: 2
 data_output_dir: openrouter_output_data/rewrite/1000docs
 allow_output_overwrite: true
 # Resume in-place when output-affecting YAML matches the copy in data_output_dir (see runner doc).
-continue: true
+continue: false
 # Typo alias also accepted: allow_outpute_overwrite
 
 # false = reformatted text per chunk; merged into ``text`` in order with OPENROUTER_CHUNK_PROGRAM delimiters.

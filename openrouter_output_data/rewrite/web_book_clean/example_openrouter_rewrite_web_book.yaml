@@ -1,0 +1,40 @@
+# Example config for openrouter_data_generation/run_openrouter_chunked.py
+# Web-text → book-like strip (internet-origin cues only); see example_prompt_rewrite_web_book.txt
+#
+# Run:
+#   export OPENROUTER_API_KEY=sk-or-...
+#   python openrouter_data_generation/run_openrouter_chunked.py openrouter_data_generation/example_openrouter_rewrite_web_book.yaml
+#
+# One live OpenRouter document (two YAML paths: dataset/denoise then this file; doc index last):
+#   python openrouter_data_generation/view_nth_input_output_diff.py --live-query \\
+#     refiner_data_generation/example_denoise.yaml openrouter_data_generation/example_openrouter_rewrite_web_book.yaml 0
+
+model: openai/gpt-oss-120b
+
+temperature: 1.0
+openrouter:
+  max_tokens: 4096
+  reasoning:
+    effort: low
+
+num_concurrent: 1024
+metrics_interval_sec: 10.0
+
+prompt_path: openrouter_data_generation/example_prompt_rewrite_web_book.txt
+
+data_parquet_dir: data/raw/DCLM-baseline-one-shard/global-shard_01_of_10/local-shard_0_of_10
+data_parquet_type: dclm
+
+chunk_size: 1000
+max_chars: 10000000
+max_docs: 300
+max_parquets: 2
+
+data_output_dir: openrouter_output_data/rewrite/web_book_clean
+allow_output_overwrite: true
+continue: false
+
+output_is_code: false
+
+# http_referer: https://github.com/GAIR-NLP/ProX
+# x_title: prox-openrouter-chunked

@@ -181,3 +181,9 @@ eval_analysis
 # Large local training outputs (not suitable for git)
 finetuning_outputs/
 finetuning_refiner/
+
+# Nested clone / local build (not part of this repo)
+_pycdc_build/
+
+# Local VeOmni checkout inside continued_pretraining (use submodule or pip install)
+continued_pretraining/veomni/
